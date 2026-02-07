@@ -5,8 +5,9 @@ httpx>=0.27,<1.0
 
 # Database (SQLAlchemy 2.0 async)
 sqlalchemy[asyncio]>=2.0,<3.0
-aiosqlite>=0.20           # SQLite async driver (dev)
-asyncpg>=0.29             # PostgreSQL async driver (prod)
+asyncpg>=0.29             # PostgreSQL async driver (production)
+aiosqlite>=0.20           # SQLite async driver (dev/testing)
+alembic>=1.13             # Database schema migrations
 
 # Config
 pyyaml>=6.0

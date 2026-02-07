@@ -1,0 +1,15 @@
+# Docker / local dev ignores
+.env
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+data/*.db
+logs/*.log
+.git/
+.github/
+base-sleuth/
+scripts/
+*.md
+!requirements.txt

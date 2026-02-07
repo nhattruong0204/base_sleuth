@@ -29,6 +29,14 @@ GET https://www.clanker.world/api/tokens?sort=desc
 ```
 Filter out tokens where description contains "bankrbot".
 
+### 2.5. Scan DexScreener for Breakout Tokens (Delayed Movers)
+```
+GET https://api.dexscreener.com/token-boosts/top/v1
+GET https://api.dexscreener.com/token-boosts/latest/v1
+GET https://api.dexscreener.com/token-profiles/latest/v1
+```
+Filter to chainId=base, fetch metrics, apply quality thresholds (liq≥$10K, vol≥$5K, momentum).
+
 ### 3. Check DexScreener for Survivors
 For each candidate, fetch:
 ```
@@ -45,6 +53,7 @@ Apply the 5-stage pipeline from SKILL.md:
 - S4: Any smart money wallets from watchlist?
 - S5: Social links, description quality
 - Champagne bonus: +15%
+- Breakout bonus: +10% (for DexScreener trending tokens)
 
 ### 5. Report
 

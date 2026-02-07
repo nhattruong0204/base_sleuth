@@ -53,7 +53,7 @@ class Token(Base):
     # Clanker metadata
     clanker_id: Mapped[Optional[int]] = mapped_column(Integer, unique=True, index=True)
     name: Mapped[Optional[str]] = mapped_column(String(256))
-    symbol: Mapped[Optional[str]] = mapped_column(String(32))
+    symbol: Mapped[Optional[str]] = mapped_column(String(256))
     image_url: Mapped[Optional[str]] = mapped_column(Text)
     description: Mapped[Optional[str]] = mapped_column(Text)
     requestor_address: Mapped[Optional[str]] = mapped_column(String(42))
@@ -76,6 +76,16 @@ class Token(Base):
 
     # Bankr attribution (detected from description + deployer address)
     is_bankr_launch: Mapped[bool] = mapped_column(Boolean, default=False)
+
+    # Breakout detection (delayed mover found via DexScreener trending)
+    is_breakout: Mapped[bool] = mapped_column(
+        Boolean, default=False,
+        comment="Token discovered via breakout scanner (DexScreener trending/boosted)",
+    )
+    discovery_source: Mapped[Optional[str]] = mapped_column(
+        String(30), default="firehose",
+        comment="'firehose' | 'champagne' | 'breakout_boost' | 'breakout_profile' | 'breakout_trending'",
+    )
 
     # Quality scoring
     quality_score: Mapped[Optional[float]] = mapped_column(Float)
@@ -217,9 +227,28 @@ class TokenMetrics(Base):
 # Engine / session helpers
 # ---------------------------------------------------------------------------
 
-def create_engine(database_url: str, echo: bool = False):
-    """Create an async engine."""
-    return create_async_engine(database_url, echo=echo)
+def create_engine(
+    database_url: str,
+    echo: bool = False,
+    pool_size: int = 10,
+    max_overflow: int = 20,
+    pool_recycle: int = 3600,
+):
+    """Create an async engine with connection pooling.
+
+    For PostgreSQL (asyncpg), uses QueuePool with configurable size.
+    For SQLite (aiosqlite), pooling kwargs are ignored by the driver.
+    """
+    kwargs: dict = {"echo": echo}
+    # Only set pool params for non-SQLite (SQLite uses StaticPool)
+    if "sqlite" not in database_url:
+        kwargs.update(
+            pool_size=pool_size,
+            max_overflow=max_overflow,
+            pool_recycle=pool_recycle,
+            pool_pre_ping=True,  # Verify connections before use
+        )
+    return create_async_engine(database_url, **kwargs)
 
 
 def create_session_factory(engine) -> async_sessionmaker:
@@ -228,6 +257,10 @@ def create_session_factory(engine) -> async_sessionmaker:
 
 
 async def init_db(engine) -> None:
-    """Create all tables (safe to call repeatedly)."""
+    """Create all tables (safe to call repeatedly).
+
+    In production with Alembic, this is a no-op fallback.
+    Use `alembic upgrade head` for schema migrations.
+    """
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)

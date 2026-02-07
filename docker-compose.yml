@@ -1,0 +1,58 @@
+# Base Sleuth — Docker Compose
+# PostgreSQL + Bot daemon for 24/7 operation
+#
+# Quick start:
+#   1. cp .env.example .env  (fill in TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID)
+#   2. docker compose up -d
+#   3. docker compose logs -f bot
+
+services:
+  # ── PostgreSQL database ────────────────────────────────────
+  db:
+    image: postgres:16-alpine
+    container_name: base-sleuth-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-clanker}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-clanker}
+      POSTGRES_DB: ${POSTGRES_DB:-clanker_tracker}
+    # No host port mapping — bot connects via internal Docker network.
+    # Uncomment below if you need direct host access for debugging:
+    # ports:
+    #   - "${DB_PORT:-5433}:5432"
+    volumes:
+      - base-sleuth-pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-clanker}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ── Base Sleuth bot ────────────────────────────────────────
+  bot:
+    build: .
+    container_name: base-sleuth-bot
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      # Database (connects to the 'db' service)
+      DATABASE_URL: "postgresql+asyncpg://${POSTGRES_USER:-clanker}:${POSTGRES_PASSWORD:-clanker}@db:5432/${POSTGRES_DB:-clanker_tracker}"
+
+      # Telegram alerts (REQUIRED — set in .env)
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN}
+      TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID}
+
+      # Optional overrides
+      CLANKER_API_KEY: ${CLANKER_API_KEY:-}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    volumes:
+      # Mount config.yaml for runtime overrides (optional)
+      - ./config.yaml:/app/config.yaml:ro
+      # Persist logs
+      - ./logs:/app/logs
+
+volumes:
+  base-sleuth-pgdata:
+    driver: local

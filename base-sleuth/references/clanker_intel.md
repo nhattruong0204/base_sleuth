@@ -86,7 +86,20 @@ pairs[0].fdv                  — fully diluted valuation
 
 ### Other Useful Endpoints
 - `/token-boosts/top/v1` — tokens paying for DexScreener boost (marketing signal)
+- `/token-boosts/latest/v1` — recently boosted tokens
 - `/token-profiles/latest/v1` — tokens with custom profiles (effort signal)
+- `/tokens/v1/{chainId}/{addrs}` — chain-specific batch lookup (up to 30 addresses)
+- Rate limit: 60 req/min for boost/profile endpoints, 300 req/min for token lookup
+
+### Breakout Scanner (added 2026-02-07)
+The breakout scanner uses the above endpoints to find Base tokens that are
+gaining momentum AFTER initial launch. Key insight: $SEVEN launched 5 days
+before first scan, was invisible to firehose, but was +412% with $85K
+liquidity when discovered via DexScreener trending.
+
+**Breakout pipeline**: boost_top + boost_latest + profiles_latest → filter
+chain=base → batch metrics via /tokens/v1/base/{addrs} → quality filter
+(liq≥$10K, vol≥$5K, momentum) → persist + score with +0.10 bonus.
 
 ---
 

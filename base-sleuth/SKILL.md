@@ -89,7 +89,12 @@ URL: https://api.dexscreener.com/latest/dex/tokens/{addr}
 Batch: comma-separated addresses, max 30 per request
 Key metrics: liquidity.usd, volume.h24, txns.h1.buys/sells,
              priceChange.h1/h24, marketCap, fdv
-Also: /token-boosts/top/v1, /token-profiles/latest/v1
+
+Breakout discovery endpoints (60 req/min each):
+  /token-boosts/top/v1       → tokens with most active boosts (marketing spend)
+  /token-boosts/latest/v1    → recently boosted tokens
+  /token-profiles/latest/v1  → tokens with custom profiles (branding effort)
+  /tokens/v1/{chainId}/{addrs} → chain-specific batch lookup (up to 30)
 ```
 
 ### Secondary Sources
@@ -102,12 +107,12 @@ Also: /token-boosts/top/v1, /token-profiles/latest/v1
 
 ## Scanning Architecture
 
-The codebase runs **three concurrent async loops**:
+The codebase runs **four concurrent async loops**:
 
 ### Loop 1 — Firehose (every 30s)
 ```
 Streams ALL new tokens from Clanker via cursor pagination.
-Stores every token in SQLite for tracking.
+Stores every token in PostgreSQL for tracking.
 Tags: is_bankr_launch, launch_platform, is_champagne, is_verified.
 ```
 
@@ -118,11 +123,61 @@ These are extremely rare (~0.02%) but 58% have real liquidity.
 Priority-queued for evaluation ahead of regular tokens.
 ```
 
-### Loop 3 — Eval Pipeline (every 10s)
+### Loop 3 — Breakout Scanner (every 180s)
 ```
-Pulls unscored tokens from DB (champagne first, then by age).
+Detects DELAYED MOVERS via DexScreener trending/boosted/profiles.
+Finds tokens that launched days ago but are NOW gaining momentum.
+Catches tokens the firehose missed (e.g. $SEVEN: 5 days old, +412%).
+
+Sources:
+  - /token-boosts/top/v1     → tokens paying for DexScreener visibility
+  - /token-boosts/latest/v1  → recently boosted Base tokens
+  - /token-profiles/latest/v1 → tokens with custom DexScreener profiles
+
+Filters: chainId=base, liq≥$10K, vol24h≥$5K, momentum required.
+Cross-references against DB to avoid re-alerting.
+Breakout tokens get +0.10 score bonus (trending signal).
+```
+
+### Loop 4 — Eval Pipeline (every 10s)
+```
+Pulls unscored tokens from DB (champagne first, breakout, then by age).
 Pre-filter → Batch DexScreener → 5-Stage Score → Telegram Alert.
 Waits 300s after discovery before DEX lookup (indexing delay).
+```
+
+### Deployment — 24/7 Docker Stack
+```
+PostgreSQL 16 (asyncpg) for persistence — all tokens stored permanently.
+Docker Compose: postgres + bot containers, auto-restart on failure.
+Alembic for schema migrations (alembic upgrade head on startup).
+Exponential backoff on transient errors (cap 5 min).
+Heartbeat logging every 5 min with uptime + stats.
+Telegram startup/shutdown pings for operational awareness.
+Connection pool: 10 base + 20 overflow, pre-ping, recycle @ 1h.
+```
+
+### Interactive Telegram Bot (bot_commands.py)
+```
+Full inline keyboard UI running alongside scanner loops.
+Uses python-telegram-bot v21+ Application in non-blocking mode.
+
+Commands:
+  /start, /menu   — Main dashboard with button grid
+  /status          — Uptime, loop health, backoff states, session stats
+  /stats           — DB stats (tokens, bankr, champagne, breakout, scoring)
+  /gems            — Recent gems above score threshold (with trade links)
+  /top             — Top 10 highest scored tokens
+  /scan            — Force scan sub-menu (firehose/champagne/breakout/eval/all)
+  /config          — View all filter settings and scoring weights
+  /help            — Full command reference
+
+Inline Buttons:
+  Dashboard grid  → Status, Stats, Gems, Top, Force Scan, Config, Champagne, Breakouts
+  Scan sub-menu   → Firehose Now, Champagne Now, Breakout Now, Eval Now, Scan All
+  Alert buttons   → DexScreener link, Uniswap link, Clanker page, Dashboard
+
+Every alert message now has inline trading buttons (DexScreener, Uniswap, Clanker).
 ```
 
 ---
@@ -196,7 +251,12 @@ Origin and social presence:
 
 Any token with the champagne tag gets a flat +0.15 score bonus on top of weighted scores.
 
-### Final Score = weighted sum + champagne bonus → alert if ≥ 0.45
+### Breakout Bonus: +10% additive
+
+Tokens discovered via the breakout scanner (DexScreener trending/boosted) get a flat +0.10 bonus.
+These tokens have proven momentum and marketing spend — strong conviction signal.
+
+### Final Score = weighted sum + champagne bonus + breakout bonus → alert if ≥ 0.45
 
 ---
 
@@ -333,6 +393,7 @@ Strategy Notes:
 ```
 BULLISH PATTERNS — Base / Clanker:
 - 🍾 Champagne tag → 58% have real liquidity (vs <1% regular)
+- 📈 Breakout detection: boosted/profiled on DexScreener with rising momentum
 - Direct launch (no bot) with rich description + social links
 - Multiple smart money wallets enter within 10 mins
 - Volume/liquidity ratio > 1.0 sustained for 30 mins

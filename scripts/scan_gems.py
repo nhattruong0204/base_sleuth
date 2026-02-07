@@ -123,6 +123,109 @@ async def scan(hours: int = 2):
         print(f"   {bankr_skipped} Bankr tokens skipped")
         print(f"   Total candidates for DexScreener: {len(candidates)}")
 
+        # ── Step 2.5: Breakout scanner — delayed movers ──
+        print()
+        print("📈 STEP 2.5: Scanning DexScreener for Base breakout tokens...")
+        breakout_addrs: set[str] = set()
+        breakout_count = 0
+
+        for endpoint_name, url in [
+            ("boosts/top", "https://api.dexscreener.com/token-boosts/top/v1"),
+            ("boosts/latest", "https://api.dexscreener.com/token-boosts/latest/v1"),
+            ("profiles/latest", "https://api.dexscreener.com/token-profiles/latest/v1"),
+        ]:
+            try:
+                br = await http.get(url, timeout=15)
+                data = br.json()
+                if isinstance(data, dict):
+                    data = [data]
+                for item in (data if isinstance(data, list) else []):
+                    chain = (item.get("chainId") or "").lower()
+                    if chain != "base":
+                        continue
+                    addr = (item.get("tokenAddress") or "").lower()
+                    if addr and addr not in seen_addrs:
+                        breakout_addrs.add(addr)
+                print(f"   {endpoint_name}: found {len([i for i in (data if isinstance(data, list) else []) if (i.get('chainId') or '').lower() == 'base'])} Base tokens")
+            except Exception as e:
+                print(f"   {endpoint_name} error: {e}")
+            await asyncio.sleep(0.3)
+
+        # Filter out tokens already in firehose candidates
+        new_breakouts = breakout_addrs - seen_addrs
+        if new_breakouts:
+            # Batch fetch metrics for breakout tokens
+            breakout_pairs = {}
+            bo_addrs = list(new_breakouts)
+            for i in range(0, len(bo_addrs), 30):
+                batch = bo_addrs[i: i + 30]
+                batch_str = ",".join(batch)
+                try:
+                    br2 = await http.get(
+                        f"https://api.dexscreener.com/tokens/v1/base/{batch_str}",
+                        timeout=15,
+                    )
+                    pairs = br2.json() if isinstance(br2.json(), list) else br2.json().get("pairs") or []
+                    for p in pairs:
+                        ba = p.get("baseToken", {}).get("address", "").lower()
+                        if ba:
+                            breakout_pairs[ba] = p
+                except Exception as e:
+                    print(f"   Breakout batch error: {e}")
+                await asyncio.sleep(0.3)
+
+            # Filter breakout tokens by quality thresholds
+            for addr, pair in breakout_pairs.items():
+                liq = (pair.get("liquidity") or {}).get("usd") or 0
+                vol24 = (pair.get("volume") or {}).get("h24") or 0
+                buys_1h = (pair.get("txns") or {}).get("h1", {}).get("buys", 0)
+                pc_1h = (pair.get("priceChange") or {}).get("h1") or 0
+
+                # Age check — skip if older than 14 days
+                pair_created = pair.get("pairCreatedAt")
+                if pair_created:
+                    created_dt = datetime.fromtimestamp(pair_created / 1000, tz=timezone.utc)
+                    age = datetime.now(timezone.utc) - created_dt
+                    if age > timedelta(days=14):
+                        continue
+
+                if liq < 10000 or vol24 < 5000:
+                    continue
+                has_momentum = buys_1h >= 20 or (isinstance(pc_1h, (int, float)) and pc_1h >= 50)
+                if not has_momentum:
+                    continue
+
+                # Add as breakout candidate
+                base_tok = pair.get("baseToken", {})
+                info = pair.get("info") or {}
+                socials = info.get("socials") or []
+                websites = info.get("websites") or []
+
+                social_links = []
+                for s in socials:
+                    social_links.append({"name": s.get("platform", ""), "link": s.get("handle", "")})
+                for w in websites:
+                    social_links.append({"name": "website", "link": w.get("url", "")})
+
+                fake_token = {
+                    "contract_address": addr,
+                    "name": base_tok.get("name", "?"),
+                    "symbol": base_tok.get("symbol", "?"),
+                    "description": "",
+                    "socialLinks": social_links,
+                    "tags": {},
+                    "_platform": "breakout",
+                    "_is_champagne": False,
+                    "_is_breakout": True,
+                }
+                seen_addrs.add(addr)
+                addr_to_token_breakout = {addr: fake_token}
+                candidates.append(fake_token)
+                breakout_count += 1
+
+        print(f"   {len(new_breakouts)} unique Base tokens from DexScreener trending")
+        print(f"   {breakout_count} qualify as breakout candidates (liq≥$10K, momentum)")
+
         # ── Step 3: Batch DexScreener lookup ──
         print()
         print("📊 STEP 3: Batch DexScreener lookup...")
@@ -179,6 +282,7 @@ async def scan(hours: int = 2):
             price_24h = (pair.get("priceChange") or {}).get("h24") or 0
 
             is_champ = t.get("_is_champagne", False)
+            is_breakout = t.get("_is_breakout", False)
             platform = t.get("_platform", "unknown")
             social_links = t.get("socialLinks") or []
             tags = t.get("tags") or {}
@@ -230,6 +334,8 @@ async def scan(hours: int = 2):
             score = s2 * 0.30 + s3 * 0.20 + s4 * 0.20 + s5 * 0.15
             if is_champ:
                 score += 0.15
+            if is_breakout:
+                score += 0.10
 
             scored.append(
                 {
@@ -247,6 +353,7 @@ async def scan(hours: int = 2):
                     "price_1h": price_1h,
                     "price_24h": price_24h,
                     "is_champ": is_champ,
+                    "is_breakout": is_breakout,
                     "verified": verified,
                     "platform": platform,
                     "social_links": social_links,
@@ -278,9 +385,10 @@ async def scan(hours: int = 2):
             print(f"\n🔥 GEMS (score ≥ 0.45) — {len(gems)} found:\n")
             for g in gems:
                 champ_badge = "🍾 Champagne" if g["is_champ"] else ""
+                breakout_badge = "📈 Breakout" if g.get("is_breakout") else ""
                 ver_badge = "✅ Verified" if g["verified"] else ""
                 plat_badge = f"🔗 {g['platform'].title()}"
-                badges = "  ".join(filter(None, [champ_badge, ver_badge, plat_badge]))
+                badges = "  ".join(filter(None, [breakout_badge, champ_badge, ver_badge, plat_badge]))
                 print(f"  🚀 {g['name']} (${g['symbol']}) — Score: {g['score']:.0%}")
                 print(f"     {badges}")
                 print(
@@ -311,9 +419,9 @@ async def scan(hours: int = 2):
         if watchlist:
             print(f"\n👀 WATCHLIST (score 0.25–0.44) — {len(watchlist)} tokens:\n")
             for w in watchlist[:10]:
-                champ = "🍾" if w["is_champ"] else "  "
+                marker = "🍾" if w["is_champ"] else ("📈" if w.get("is_breakout") else "  ")
                 print(
-                    f"  {champ} {w['name'][:25]:25s} ${w['symbol']:8s} "
+                    f"  {marker} {w['name'][:25]:25s} ${w['symbol']:8s} "
                     f"Score:{w['score']:.0%}  Liq:${w['liq']:>8,.0f}  "
                     f"Vol:${w['vol24']:>8,.0f}  Buys1h:{w['buys_1h']:>3}  "
                     f"[{w['platform']}]"
@@ -322,6 +430,7 @@ async def scan(hours: int = 2):
         dead = len(candidates) - len(dex_results)
         print(f"\n💀 Dead on arrival (no DEX data): {dead}/{len(candidates)} candidates")
         print(f"🏦 Bankr tokens skipped: {bankr_skipped}")
+        print(f"📈 Breakout candidates from DexScreener: {breakout_count}")
 
 
 if __name__ == "__main__":

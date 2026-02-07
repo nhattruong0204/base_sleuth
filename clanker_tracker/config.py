@@ -16,10 +16,13 @@ from pydantic import BaseModel, Field
 
 class DatabaseConfig(BaseModel):
     url: str = Field(
-        default="sqlite+aiosqlite:///data/clanker_tracker.db",
-        description="Async SQLAlchemy database URL",
+        default="postgresql+asyncpg://clanker:clanker@localhost:5432/clanker_tracker",
+        description="Async SQLAlchemy database URL (PostgreSQL recommended for production)",
     )
     echo: bool = False
+    pool_size: int = Field(default=10, ge=1, description="Connection pool size")
+    max_overflow: int = Field(default=20, ge=0, description="Max overflow connections beyond pool_size")
+    pool_recycle: int = Field(default=3600, description="Recycle connections after N seconds (prevent stale PG connections)")
 
 
 class ClankerAPIConfig(BaseModel):
@@ -35,6 +38,31 @@ class ClankerAPIConfig(BaseModel):
         description="x-api-key header for authenticated endpoints (deploy, get-by-address)",
     )
     page_size: int = Field(default=50, ge=1, le=100)
+
+
+class BackfillConfig(BaseModel):
+    """Settings for backfilling tokens on first startup.
+
+    On the very first run (empty DB), the firehose only sees the latest
+    page of tokens.  Backfill pages backward through the Clanker API
+    to catch tokens from the last N hours so nothing is missed.
+    """
+
+    enabled: bool = Field(
+        default=True,
+        description="Enable backfill on first run (empty database)",
+    )
+    hours: int = Field(
+        default=12,
+        ge=1,
+        le=48,
+        description="How many hours of history to backfill on first run",
+    )
+    max_pages: int = Field(
+        default=200,
+        ge=1,
+        description="Safety cap: max pages to backfill (10 tokens per page)",
+    )
 
 
 class BankrConfig(BaseModel):
@@ -158,6 +186,107 @@ class FilteringConfig(BaseModel):
     )
 
 
+class BreakoutConfig(BaseModel):
+    """Settings for the breakout scanner — detects delayed movers.
+
+    Uses DexScreener trending/boosted/profiles endpoints to find Base
+    tokens that are gaining momentum AFTER launch.  These are tokens
+    the firehose may have already passed over but are now showing life.
+    """
+
+    enabled: bool = Field(
+        default=True,
+        description="Enable the breakout scanner loop",
+    )
+    poll_interval_seconds: int = Field(
+        default=180,
+        ge=60,
+        description="How often to scan DexScreener for breakout tokens (seconds)",
+    )
+    min_liquidity_usd: float = Field(
+        default=10_000.0,
+        description="Minimum liquidity to consider a breakout candidate",
+    )
+    min_volume_24h_usd: float = Field(
+        default=5_000.0,
+        description="Minimum 24h volume to consider a breakout candidate",
+    )
+    min_buys_1h: int = Field(
+        default=20,
+        description="Minimum buys in last hour for breakout signal",
+    )
+    min_price_change_1h_pct: float = Field(
+        default=50.0,
+        description="Minimum 1h price change % to flag as breakout",
+    )
+    max_age_days: int = Field(
+        default=14,
+        description="Ignore tokens older than this (focus on recent launches)",
+    )
+    breakout_score_bonus: float = Field(
+        default=0.10,
+        description="Flat score bonus for tokens detected via breakout scanner",
+    )
+    rescan_cooldown_seconds: int = Field(
+        default=3600,
+        description="Don't re-evaluate a breakout token within this window",
+    )
+
+
+class GainersConfig(BaseModel):
+    """Settings for the DexScreener gainers / search scanner.
+
+    Uses the DexScreener search endpoint with rotating keywords to
+    discover high-volume Base tokens the firehose and breakout scanner
+    missed.  Also checks community-takeover tokens.
+    """
+
+    enabled: bool = Field(
+        default=True,
+        description="Enable the gainers scanner loop",
+    )
+    poll_interval_seconds: int = Field(
+        default=120,
+        ge=60,
+        description="How often to scan DexScreener search for gainers (seconds)",
+    )
+    search_keywords: list[str] = Field(
+        default_factory=lambda: [
+            "clanker", "base agent", "base ai", "base meme",
+            "clawnch", "farcaster token", "base new",
+        ],
+        description="Rotating search keywords for DexScreener /latest/dex/search",
+    )
+    min_liquidity_usd: float = Field(
+        default=5_000.0,
+        description="Minimum liquidity to consider a gainer candidate",
+    )
+    min_volume_1h_usd: float = Field(
+        default=1_000.0,
+        description="Minimum 1h volume for gainer detection",
+    )
+    min_buys_1h: int = Field(
+        default=10,
+        description="Minimum buy txns in last hour",
+    )
+    min_price_change_1h_pct: float = Field(
+        default=20.0,
+        description="Minimum 1h price change % to flag as a gainer",
+    )
+    max_age_days: int = Field(
+        default=7,
+        description="Ignore tokens older than this many days",
+    )
+    gainer_score_bonus: float = Field(
+        default=0.05,
+        description="Flat score bonus for tokens detected via gainers scanner",
+    )
+    rescan_cooldown_seconds: int = Field(
+        default=1800,
+        description="Don't re-check the same gainer within this window",
+    )
+
+
 class TelegramConfig(BaseModel):
     bot_token: Optional[str] = None
     chat_id: Optional[str] = None
@@ -180,10 +309,13 @@ class ScrapingConfig(BaseModel):
 class AppConfig(BaseModel):
     database: DatabaseConfig = Field(default_factory=DatabaseConfig)
     clanker: ClankerAPIConfig = Field(default_factory=ClankerAPIConfig)
+    backfill: BackfillConfig = Field(default_factory=BackfillConfig)
     bankr: BankrConfig = Field(default_factory=BankrConfig)
     dexscreener: DexScreenerConfig = Field(default_factory=DexScreenerConfig)
     base_rpc: BaseRPCConfig = Field(default_factory=BaseRPCConfig)
     filtering: FilteringConfig = Field(default_factory=FilteringConfig)
+    breakout: BreakoutConfig = Field(default_factory=BreakoutConfig)
+    gainers: GainersConfig = Field(default_factory=GainersConfig)
     telegram: TelegramConfig = Field(default_factory=TelegramConfig)
     scraping: ScrapingConfig = Field(default_factory=ScrapingConfig)
     log_level: str = "INFO"
@@ -201,6 +333,7 @@ def _env_override(cfg: dict) -> dict:
         "TELEGRAM_CHAT_ID": ("telegram", "chat_id"),
         "DATABASE_URL": ("database", "url"),
         "BASE_RPC_WS": ("base_rpc", "ws_url"),
+        "DB_POOL_SIZE": ("database", "pool_size"),
     }
     for env_var, path in mapping.items():
         value = os.environ.get(env_var)

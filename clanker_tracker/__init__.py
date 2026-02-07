@@ -1,3 +1,6 @@
-"""Clanker Token Tracker — monitors new token launches on Clanker (Base chain)."""
+"""Clanker Token Tracker — monitors new token launches on Clanker (Base chain).
 
-__version__ = "0.1.0"
+24/7 autonomous daemon with PostgreSQL persistence and Telegram alerts.
+"""
+
+__version__ = "1.0.0"

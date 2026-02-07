@@ -12,24 +12,29 @@ You are working on **Base Sleuth**, an autonomous hidden-gem discovery agent for
 
 ## Project Architecture
 
-- **3 async loops**: firehose (30s), champagne scanner (120s), eval pipeline (10s)
+- **4 async loops**: firehose (30s), champagne scanner (120s), breakout scanner (180s), eval pipeline (10s)
 - **5-stage scoring**: pre-filter → reject gate → DEX metrics → momentum → smart money → context
 - **Bankr detection**: 92% of Clanker launches are Bankr bot spam — auto-skipped via description parsing
 - **Champagne tag**: Only 0.02% of tokens, but 58% have real liquidity — highest priority signal
+- **Breakout scanner**: Uses DexScreener trending/boosted/profiles to find delayed movers on Base
 
 ## Key Files
 
 | File | Role |
 |------|------|
-| `clanker_tracker/main.py` | 3-loop async orchestrator |
+| `clanker_tracker/main.py` | 4-loop async orchestrator (firehose, champagne, breakout, eval) |
 | `clanker_tracker/filters.py` | Pre-filter + 5-stage scoring pipeline |
-| `clanker_tracker/clanker_client.py` | Cursor-based API polling + champagne scan |
+| `clanker_tracker/clanker_client.py` | Cursor-based API polling + champagne scan + breakout scanner |
 | `clanker_tracker/models.py` | SQLAlchemy async ORM (Token, TokenContext, TokenMetrics) |
 | `clanker_tracker/config.py` | Pydantic config with all thresholds and weights |
-| `clanker_tracker/notifier.py` | Telegram alerts with badges and score breakdown |
+| `clanker_tracker/notifier.py` | Telegram alerts with badges, score breakdown, and inline buttons |
+| `clanker_tracker/bot_commands.py` | Interactive Telegram bot (commands, inline keyboard, force scan) |
 | `clanker_tracker/context_resolver.py` | Origin tracing (social URLs → page scrape → DDG) |
 | `config.example.yaml` | All configurable settings with comments |
 | `data/smart_money_wallets.txt` | Machine-readable wallet list for Stage 4 |
+| `alembic/` | PostgreSQL schema migrations (Alembic) |
+| `docker-compose.yml` | PostgreSQL + bot deployment stack |
+| `Dockerfile` | Production container image |
 
 ## Clanker API Facts (IMPORTANT — don't get these wrong)
 
@@ -43,7 +48,10 @@ You are working on **Base Sleuth**, an autonomous hidden-gem discovery agent for
 ## Tech Stack
 
 - Python 3.12, async (`asyncio`, `httpx`, `SQLAlchemy 2.0 async`)
-- SQLite + aiosqlite (dev), Pydantic config, structlog logging
+- **PostgreSQL** (asyncpg) for production, SQLite for dev/testing
+- **Alembic** for database schema migrations
+- **Docker Compose** for 24/7 deployment (PostgreSQL + bot containers)
+- Pydantic config, structlog logging
 - `python-telegram-bot` for notifications, `BeautifulSoup` for scraping
 
 ## Rules
@@ -52,5 +60,6 @@ You are working on **Base Sleuth**, an autonomous hidden-gem discovery agent for
 - Use `structlog` for logging, never `print()`
 - All new config fields go in `config.py` (Pydantic) AND `config.example.yaml`
 - New scoring signals should be added as a stage in `filters.py`
+- New DB columns require an Alembic migration in `alembic/versions/`
 - When updating strategy, also update `base-sleuth/references/strategy_evolution.md`
 - Keep `base-sleuth/SKILL.md` in sync with any pipeline changes

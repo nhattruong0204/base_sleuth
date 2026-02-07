@@ -6,9 +6,9 @@ This document tracks the evolution of the gem-hunting strategy based on paper tr
 
 ---
 
-## Current Strategy Version: 1.0
+## Current Strategy Version: 1.3
 
-**Last Updated**: 2026-02-07 (initial)
+**Last Updated**: 2026-02-08
 **Based on**: Live Clanker API data analysis (431K+ tokens, 38K/day)
 
 ### Active Scanning Strategy
@@ -73,6 +73,131 @@ This document tracks the evolution of the gem-hunting strategy based on paper tr
 - Expected eval candidates per day: ~3,000
 - Expected alerts per day: unknown (need data)
 - Champagne alerts per day: 0-2 (very rare)
+
+---
+
+### Iteration #1 — 2026-02-07 — Breakout Scanner
+
+**Trigger**: $SEVEN (0x0DBFe...3c6b) launched 5 days before scan, pumped +412%
+with $85K liquidity and 337 buys/hr. Firehose missed it because it only
+watches NEW launches. Token scored 44% when manually evaluated — just 1%
+below gem threshold.
+
+**Problem Identified**: Firehose-only scanning creates a blind spot for
+delayed breakouts. Tokens can be dormant for days then suddenly gain
+momentum from community discovery, influencer mention, or marketing push.
+
+**Solution — Breakout Scanner (Loop 3)**:
+- Uses DexScreener trending/boosted/profiles endpoints
+- Filters to Base chain, liq≥$10K, vol24h≥$5K, momentum required
+- Cross-references DB to avoid re-alerting
+- Breakout tokens get +0.10 score bonus
+- Polls every 180s (3 min)
+- Cooldown: 3600s per token to prevent spam
+
+**Changes Made**:
+- `clanker_client.py`: Added `BreakoutScanner` class
+- `main.py`: Added 4th concurrent loop (`_breakout_loop`)
+- `config.py`: Added `BreakoutConfig` section
+- `filters.py`: Added `_breakout_bonus` to weighted score
+- `notifier.py`: Added 📈 Breakout badge to alerts
+- `models.py`: Added `is_breakout` + `discovery_source` columns
+- `scripts/scan_gems.py`: Added Step 2.5 breakout scan
+
+**Hypotheses to Validate**:
+- What % of DexScreener boosted Base tokens are Clanker-deployed?
+- Does the +0.10 breakout bonus help or cause false positives?
+- Is 180s poll interval fast enough to catch breakouts early?
+- How many breakout candidates per scan cycle on average?
+- Do breakout tokens have better win rates than firehose discoveries?
+
+---
+
+### Iteration #2 — 2026-02-07 — PostgreSQL + 24/7 Daemon
+
+**Trigger**: Need for persistent, always-on scanning with Telegram alerts.
+SQLite insufficient for production — no concurrent access, no connection pooling,
+no schema migrations.
+
+**Changes — Database Migration**:
+- Switched default database from SQLite to PostgreSQL (asyncpg driver)
+- Added connection pool settings (pool_size=10, max_overflow=20, pool_recycle=3600s)
+- Added pool_pre_ping=True for stale connection detection
+- `models.py`: `create_engine()` now accepts pool params, auto-skips for SQLite
+- `config.py`: `DatabaseConfig` updated with pool_size, max_overflow, pool_recycle fields
+
+**Changes — Alembic Migrations**:
+- Added `alembic/` directory with async env.py
+- Initial migration `001_initial_schema.py` creates all 3 tables
+- Partial index `ix_tokens_unscored` for fast eval loop queries
+- Reads DATABASE_URL from env → config.yaml → alembic.ini (priority order)
+
+**Changes — 24/7 Resilience**:
+- `main.py`: Exponential backoff on all 4 loops (2^n seconds, cap 5 min)
+- Per-loop error counters + backoff state
+- Stats tracking: tokens_discovered, tokens_scored, alerts_sent, errors
+- Heartbeat logging every 5 min with uptime + all stats
+- Telegram startup/shutdown pings for operational awareness
+- Eval loop now prioritizes: champagne → breakout → oldest unscored
+
+**Changes — Docker Deployment**:
+- `Dockerfile`: Multi-stage build, non-root user, health check
+- `docker-compose.yml`: PostgreSQL 16 + bot, auto-restart, health deps
+- `.env.example`: Template for TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, DB creds
+- `__main__.py`: `python -m clanker_tracker` entry point
+- Entrypoint runs `alembic upgrade head` before starting bot
+
+**Changes — Infrastructure**:
+- `requirements.txt`: Added alembic>=1.13
+- `config.example.yaml`: PostgreSQL as default, pool settings documented
+- Version bumped to 1.0.0
+
+---
+
+### Iteration #3 — 2026-02-08 — Interactive Telegram Bot
+
+**Trigger**: Need to interact with the bot in real-time from Telegram —
+check status, view gems, force scans, browse champagne/breakout tokens.
+Previously Telegram was one-way alerts only.
+
+**Changes — Interactive Bot (bot_commands.py)**:
+- New module `clanker_tracker/bot_commands.py` with full inline keyboard UI
+- Uses `python-telegram-bot` v21+ `Application` in non-blocking mode
+- Runs alongside all 4 scanner loops in the same event loop
+- `build_telegram_app()` creates Application with all handlers registered
+- Stores Tracker reference in `bot_data` for handler access to DB/stats
+
+**Commands Added**:
+- `/start`, `/menu` — Main dashboard with 9-button inline keyboard grid
+- `/status` — Uptime, loop health (green/yellow/red), backoff states, session stats
+- `/stats` — Full DB statistics (total, bankr, champagne, breakout, scored, pending, alerts)
+- `/gems` — Recent gems above score threshold with DexScreener/Uniswap links
+- `/top` — Top 10 highest scored tokens across all sources
+- `/scan` — Force scan sub-menu (firehose/champagne/breakout/eval/all)
+- `/config` — View all filter config, scoring weights, breakout settings
+- `/help` — Complete command reference
+
+**Inline Keyboard Menus**:
+- Main dashboard: Status, Stats, Gems, Top, Force Scan, Config, Champagne, Breakouts, Help
+- Scan sub-menu: Firehose Now, Champagne Now, Breakout Now, Eval Now, Scan All, Back
+- Every response has Back to Menu button for easy navigation
+
+**Changes — Alert Buttons (notifier.py)**:
+- Token alert messages now include inline buttons: DexScreener, Uniswap, Clanker Page, Dashboard
+- Users can trade directly from alert notifications
+
+**Changes — main.py Integration**:
+- Added `_start_telegram_bot()` / `_stop_telegram_bot()` lifecycle methods
+- Application starts before scanner loops, stops during graceful shutdown
+- `drop_pending_updates=True` to avoid replaying stale button presses
+- Startup ping now mentions `/menu` for interactive access
+
+**Files Modified**:
+- `clanker_tracker/bot_commands.py` (new — 480+ lines)
+- `clanker_tracker/main.py` (Telegram app lifecycle integration)
+- `clanker_tracker/notifier.py` (alert inline buttons)
+- `base-sleuth/SKILL.md` (interactive bot documentation)
+- `.github/copilot-instructions.md` (added bot_commands.py to key files)
 
 ---
 

@@ -4,8 +4,12 @@
 # TELEGRAM_CHAT_ID, DATABASE_URL, BASE_RPC_WS
 
 database:
-  url: "sqlite+aiosqlite:///data/clanker_tracker.db"
+  # PostgreSQL (recommended for production 24/7 operation)
+  url: "postgresql+asyncpg://clanker:clanker@localhost:5432/clanker_tracker"
   echo: false
+  pool_size: 10               # Connection pool size
+  max_overflow: 20            # Extra connections beyond pool_size
+  pool_recycle: 3600          # Recycle stale connections (seconds)
 
 clanker:
   base_url: "https://www.clanker.world/api"
@@ -72,6 +76,53 @@ filtering:
 
   score_threshold: 0.45               # Minimum to trigger Telegram alert
   recheck_delay_seconds: 300          # Wait before DEX lookup (index time)
+
+# ── Breakout Scanner — delayed mover detection ───────────
+# Finds tokens that launched days ago but are NOW gaining momentum.
+# Uses DexScreener trending/boosted/profiles endpoints to detect tokens
+# the firehose missed (e.g. $SEVEN: launched 5 days ago, then +412%).
+breakout:
+  enabled: true
+  poll_interval_seconds: 180           # How often to scan (3 min default)
+  min_liquidity_usd: 10000             # Min liquidity for breakout candidate
+  min_volume_24h_usd: 5000             # Min 24h volume
+  min_buys_1h: 20                      # Min buy txns in last hour
+  min_price_change_1h_pct: 50          # Min 1h price change % (OR with buys)
+  max_age_days: 14                     # Ignore tokens older than 2 weeks
+  breakout_score_bonus: 0.10           # Flat bonus added to weighted score
+  rescan_cooldown_seconds: 3600        # Don't re-check same token within 1h
+
+# ── Backfill — catch recent tokens on first startup ──────
+# On first run (empty DB), pages backward through Clanker API
+# to discover tokens from the last N hours. Prevents missing
+# launches that happened before the bot started.
+backfill:
+  enabled: true
+  hours: 12                            # How many hours back to scan
+  max_pages: 200                       # Safety cap (10 tokens/page)
+
+# ── Gainers Scanner — DexScreener search + community takeovers ──
+# Actively searches DexScreener for high-momentum Base tokens using
+# rotating keywords and community takeover feeds. Catches tokens that
+# the firehose and breakout scanner missed (e.g. organic trending).
+gainers:
+  enabled: true
+  poll_interval_seconds: 120           # How often to search (2 min default)
+  search_keywords:                     # Rotated 2 per cycle
+    - "clanker"
+    - "base meme"
+    - "base agent"
+    - "farcaster token"
+    - "base degen"
+    - "onchain ai"
+    - "base community"
+  min_liquidity_usd: 5000             # Min liquidity for gainers candidate
+  min_volume_1h_usd: 1000             # Min 1h volume (USD)
+  min_buys_1h: 10                      # Min buy txns in last hour
+  min_price_change_1h_pct: 20          # Min 1h price change %
+  max_age_days: 7                      # Ignore tokens older than 1 week
+  gainer_score_bonus: 0.05             # Flat bonus added to weighted score
+  rescan_cooldown_seconds: 1800        # Don't re-check same token within 30 min
 
 telegram:
   bot_token: null          # or set TELEGRAM_BOT_TOKEN env var

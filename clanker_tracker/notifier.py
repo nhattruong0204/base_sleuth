@@ -6,14 +6,16 @@ Sends rich HTML-formatted alerts containing:
 - Project idea summary
 - Quality score breakdown
 - Quick trading links (DexScreener, Uniswap on Base)
+- Inline action buttons for trading and details
 """
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from typing import Optional
 
 import structlog
-from telegram import Bot
+from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ParseMode
 from telegram.error import TelegramError
 
@@ -49,15 +51,18 @@ class TelegramNotifier:
             return False
 
         message = self._format_message(token, ctx, result)
+        buttons = self._build_alert_buttons(token)
 
         try:
-            await self._bot.send_message(
-                chat_id=self.cfg.chat_id,
-                text=message,
-                parse_mode=ParseMode.HTML,
-                disable_web_page_preview=True,
-                disable_notification=self.cfg.disable_notification,
-            )
+            async with Bot(token=self.cfg.bot_token) as bot:
+                await bot.send_message(
+                    chat_id=self.cfg.chat_id,
+                    text=message,
+                    parse_mode=ParseMode.HTML,
+                    disable_web_page_preview=True,
+                    disable_notification=self.cfg.disable_notification,
+                    reply_markup=buttons,
+                )
             logger.info("telegram.sent", token=token.symbol, score=result.final_score)
             return True
         except TelegramError as exc:
@@ -78,6 +83,8 @@ class TelegramNotifier:
 
         # ── Header with badges ──────────────────────────────
         badges: list[str] = []
+        if getattr(token, "is_breakout", False):
+            badges.append("📈 Breakout")
         if getattr(token, "is_champagne", False):
             badges.append("🍾 Champagne")
         if getattr(token, "is_verified", False):
@@ -154,12 +161,58 @@ class TelegramNotifier:
             f'🔍 <a href="https://www.clanker.world/clanker/{addr}">Clanker Page</a>'
         )
 
+        # ── Time since launch ───────────────────────────────
+        launched = getattr(token, "launched_at", None)
+        if launched:
+            delta = datetime.now(timezone.utc) - launched
+            total_seconds = int(delta.total_seconds())
+            if total_seconds < 0:
+                age_str = "just now"
+            elif total_seconds < 3600:
+                mins = max(1, total_seconds // 60)
+                age_str = f"{mins} minute{'s' if mins != 1 else ''}"
+            elif total_seconds < 86400:
+                hrs = total_seconds // 3600
+                age_str = f"{hrs} hour{'s' if hrs != 1 else ''}"
+            else:
+                days = total_seconds // 86400
+                age_str = f"{days} day{'s' if days != 1 else ''}"
+            lines.append("")
+            lines.append(f"⏰ Time Since Launch: {age_str}")
+
         return "\n".join(lines)
 
     @staticmethod
     def _score_bar(score: float, length: int = 10) -> str:
         filled = round(score * length)
         return "█" * filled + "░" * (length - filled)
+
+    @staticmethod
+    def _build_alert_buttons(token: Token) -> InlineKeyboardMarkup:
+        """Build inline action buttons for a token alert."""
+        addr = token.contract_address
+        return InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton(
+                    "📊 DexScreener",
+                    url=f"https://dexscreener.com/base/{addr}",
+                ),
+                InlineKeyboardButton(
+                    "🦄 Uniswap",
+                    url=f"https://app.uniswap.org/swap?chain=base&outputCurrency={addr}",
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    "🔍 Clanker Page",
+                    url=f"https://www.clanker.world/clanker/{addr}",
+                ),
+                InlineKeyboardButton(
+                    "📋 Dashboard",
+                    callback_data="menu",
+                ),
+            ],
+        ])
 
 
 def _esc(text: str) -> str:

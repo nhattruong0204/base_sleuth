@@ -61,6 +61,7 @@ class TokenFilter:
         self.dex_cfg = config.dexscreener
         self._http = http
         self._smart_wallets: set[str] = set()
+        self._breakout_bonus: float = config.breakout.breakout_score_bonus
         self._load_smart_wallets()
 
     def _load_smart_wallets(self) -> None:
@@ -142,11 +143,9 @@ class TokenFilter:
         result.stage_reached = 4
 
         # ── Stage 5: Context quality ──
-        ctx = (
-            await session.get(TokenContext, token.id)
-            if token.context is None
-            else token.context
-        )
+        # Always use explicit async get — never lazy-load relationships
+        # in async sessions (triggers MissingGreenlet error with asyncpg)
+        ctx = await session.get(TokenContext, token.id)
         s5 = self._stage5_context_quality(token, ctx)
         result.stage_results.append(s5)
         result.stage_reached = 5
@@ -170,6 +169,7 @@ class TokenFilter:
             score=round(result.final_score, 3),
             rejected=result.rejected,
             champagne=token.is_champagne,
+            breakout=getattr(token, "is_breakout", False),
             platform=token.launch_platform,
         )
         return result
@@ -392,6 +392,10 @@ class TokenFilter:
         # Champagne bonus — curated tokens get a flat boost
         if token.is_champagne:
             raw += self.cfg.weight_champagne_bonus
+
+        # Breakout bonus — tokens detected via DexScreener trending
+        if getattr(token, "is_breakout", False):
+            raw += self._breakout_bonus
 
         return round(min(raw, 1.0), 4)
 
