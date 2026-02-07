@@ -1,0 +1,63 @@
+# Clanker Token Tracker — example configuration
+# Copy to config.yaml and fill in your values.
+# Environment variables override: CLANKER_API_KEY, TELEGRAM_BOT_TOKEN,
+# TELEGRAM_CHAT_ID, DATABASE_URL, BASE_RPC_WS
+
+database:
+  url: "sqlite+aiosqlite:///data/clanker_tracker.db"
+  echo: false
+
+clanker:
+  base_url: "https://www.clanker.world/api"
+  poll_interval_seconds: 30
+  api_key: null            # x-api-key for authenticated endpoints
+  page_size: 50
+
+bankr:
+  deployer_addresses:
+    # Add known Bankr deployer wallet addresses here (lowercase)
+    # - "0x1234..."
+  sdk_endpoint: null
+  micropayment_amount_usd: 0.10
+
+dexscreener:
+  base_url: "https://api.dexscreener.com/latest/dex"
+  rate_limit_per_minute: 60
+
+base_rpc:
+  http_url: "https://mainnet.base.org"
+  ws_url: null             # wss://... for real-time TokenCreated events
+
+filtering:
+  min_pool_liquidity_usd: 500
+  scam_keywords:
+    - rug
+    - scam
+    - honeypot
+    - honey pot
+    - ponzi
+    - fake
+    - drain
+  min_mcap_usd: 1000
+  min_volume_5m_usd: 100
+  min_holders: 5
+  min_buy_sell_ratio: 0.3
+  smart_money_wallet_file: "data/smart_money_wallets.txt"
+  smart_money_weight: 2.0
+  context_quality_weight: 1.5
+  require_origin_url: false
+  score_threshold: 0.55
+
+telegram:
+  bot_token: null          # or set TELEGRAM_BOT_TOKEN env var
+  chat_id: null            # or set TELEGRAM_CHAT_ID env var
+  disable_notification: false
+  parse_mode: HTML
+
+scraping:
+  clanker_page_url: "https://www.clanker.world/clanker/{address}"
+  ddg_search_template: "${symbol} bankrbot site:x.com"
+  request_timeout_seconds: 15
+  max_retries: 2
+
+log_level: INFO

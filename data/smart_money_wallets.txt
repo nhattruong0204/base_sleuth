@@ -1,0 +1,6 @@
+# Smart Money Wallets — one address per line (lowercase)
+# These are known profitable wallets whose early buys signal quality.
+# Add addresses discovered from on-chain analysis.
+#
+# Example:
+# 0x1234567890abcdef1234567890abcdef12345678

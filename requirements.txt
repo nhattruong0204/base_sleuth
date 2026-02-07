@@ -1,0 +1,26 @@
+# Clanker Token Tracker — dependencies
+
+# Async HTTP
+httpx>=0.27,<1.0
+
+# Database (SQLAlchemy 2.0 async)
+sqlalchemy[asyncio]>=2.0,<3.0
+aiosqlite>=0.20           # SQLite async driver (dev)
+asyncpg>=0.29             # PostgreSQL async driver (prod)
+
+# Config
+pyyaml>=6.0
+pydantic>=2.0,<3.0
+
+# Scraping
+beautifulsoup4>=4.12
+lxml>=5.0                 # Fast HTML parser for BS4
+
+# Telegram
+python-telegram-bot>=21.0,<22.0
+
+# Logging
+structlog>=24.0
+
+# Base chain (optional — for future WebSocket event monitoring)
+# web3>=7.0
