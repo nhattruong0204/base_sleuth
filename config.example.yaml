@@ -1,0 +1,77 @@
+# Clanker Token Tracker Configuration
+# Copy to config.yaml and fill in your values
+
+# --- Database ---
+database:
+  # "sqlite" for dev, "postgresql" for prod
+  backend: "sqlite"
+  # SQLite path (ignored if backend=postgresql)
+  sqlite_path: "data/tracker.db"
+  # PostgreSQL DSN (ignored if backend=sqlite)
+  # postgres_dsn: "postgresql+asyncpg://user:pass@localhost:5432/clanker_tracker"
+
+# --- Clanker API ---
+clanker:
+  base_url: "https://www.clanker.world/api"
+  # Poll interval in seconds
+  poll_interval_seconds: 30
+  # Max tokens per page
+  page_size: 50
+
+# --- Known Bankr Deployer Addresses ---
+# These are the wallet addresses that Bankr uses to deploy tokens via Clanker.
+# Update as needed — you can discover these by checking recent Bankr-launched
+# tokens on clanker.world and noting the requestorAddress.
+bankr:
+  deployer_addresses:
+    - "0x0000000000000000000000000000000000000000"  # TODO: replace with actual
+
+# --- Context Resolution ---
+context:
+  # Enable async scraping of clanker.world token pages for X/Farcaster context
+  enabled: true
+  # Max concurrent scrape requests
+  max_concurrency: 3
+  # Delay between scrape requests (be nice to their server)
+  request_delay_seconds: 2
+  # Also attempt web search for "$SYMBOL bankrbot site:x.com" context
+  web_search_fallback: true
+
+# --- Filtering ---
+filtering:
+  # Stage 1: Instant reject thresholds
+  min_starting_mcap_eth: 1.0       # Skip sub-1 ETH mcap launches (likely test tokens)
+  
+  # Stage 2: Early metrics (checked at 5min, 15min, 30min marks)
+  min_unique_buyers_5min: 5        # At least N unique buyers in first 5 min
+  min_volume_eth_15min: 0.5        # Minimum trading volume in first 15 min
+  max_top_holder_pct: 40.0         # Reject if top holder has >N% of supply (excl. LP)
+  min_buy_sell_ratio: 1.5          # Buy/sell tx count ratio
+  
+  # Stage 3: Smart money
+  # Path to a file with known profitable wallet addresses (one per line)
+  smart_money_wallets_file: "data/smart_money_wallets.txt"
+  # If N or more smart money wallets buy in first 30min, boost score
+  smart_money_threshold: 2
+  
+  # Stage 4: Context quality
+  # Tokens with traceable X/Farcaster origin score higher
+  # Tokens from accounts with high followers score higher
+  context_weight: 0.3
+
+# --- Notifications ---
+telegram:
+  enabled: true
+  bot_token: "YOUR_BOT_TOKEN"
+  chat_id: "YOUR_CHAT_ID"
+  # Minimum quality score (0-100) to trigger notification
+  min_score_to_notify: 60
+  # Cooldown between notifications (seconds)
+  cooldown_seconds: 30
+
+# --- Logging ---
+logging:
+  level: "INFO"  # DEBUG, INFO, WARNING, ERROR
+  file: "logs/tracker.log"
+  # Structured JSON logging
+  json_format: true
