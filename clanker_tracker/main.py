@@ -1,8 +1,9 @@
 """Async orchestrator for the Clanker Token Tracker.
 
-Runs two concurrent loops:
-- Poll loop    : fetches new tokens from Clanker API every N seconds
-- Eval loop    : scores unprocessed tokens and sends Telegram alerts
+Runs three concurrent loops:
+- Firehose loop   : streams ALL new tokens via cursor pagination (30s poll)
+- Champagne loop  : scans champagne-tagged curated gems (120s poll)
+- Eval loop       : pre-filters → batch DexScreener → scores → alerts
 
 Handles graceful shutdown via SIGINT / SIGTERM.
 """
@@ -79,6 +80,7 @@ class Tracker:
         logger.info("tracker.running")
         await asyncio.gather(
             self._poll_loop(),
+            self._champagne_loop(),
             self._eval_loop(),
         )
 
@@ -86,7 +88,7 @@ class Tracker:
         logger.info("tracker.stopped")
 
     # ------------------------------------------------------------------
-    # Poll loop — discover new tokens
+    # Firehose poll loop — discover ALL new tokens
     # ------------------------------------------------------------------
 
     async def _poll_loop(self) -> None:
@@ -97,41 +99,133 @@ class Tracker:
                     new_tokens = await self._client.poll(session)
                     await session.commit()
                     if new_tokens:
-                        logger.info("poll.batch", count=len(new_tokens))
+                        bankr_ct = sum(1 for t in new_tokens if t.is_bankr_launch)
+                        logger.info(
+                            "poll.batch",
+                            count=len(new_tokens),
+                            bankr=bankr_ct,
+                            other=len(new_tokens) - bankr_ct,
+                        )
             except Exception:
                 logger.exception("poll.error")
 
-            # Interruptible sleep
             try:
                 await asyncio.wait_for(self._shutdown.wait(), timeout=interval)
-                break  # shutdown signalled
+                break
             except asyncio.TimeoutError:
-                pass  # normal timeout → next iteration
+                pass
 
     # ------------------------------------------------------------------
-    # Eval loop — score & notify
+    # Champagne scan loop — curated gems only
+    # ------------------------------------------------------------------
+
+    async def _champagne_loop(self) -> None:
+        """Periodically fetch champagne-tagged tokens (Clanker's curated tier).
+
+        These are extremely rare (~0.02% of all tokens) but have a 58%
+        chance of having real liquidity — vs <1% for regular tokens.
+        """
+        interval = self.cfg.clanker.champagne_poll_interval_seconds
+        while not self._shutdown.is_set():
+            try:
+                async with self._session_factory() as session:
+                    gems = await self._client.poll_champagne(session)
+                    await session.commit()
+                    if gems:
+                        logger.info(
+                            "champagne.found",
+                            count=len(gems),
+                            names=[t.name for t in gems],
+                        )
+            except Exception:
+                logger.exception("champagne.error")
+
+            try:
+                await asyncio.wait_for(self._shutdown.wait(), timeout=interval)
+                break
+            except asyncio.TimeoutError:
+                pass
+
+    # ------------------------------------------------------------------
+    # Eval loop — pre-filter → batch DEX → score → notify
     # ------------------------------------------------------------------
 
     async def _eval_loop(self) -> None:
-        """Process tokens that have not been scored yet."""
-        # Small initial delay so the poll loop can populate the DB first
+        """Process tokens that have not been scored yet.
+
+        Pipeline:
+        1. Fetch unscored tokens from DB
+        2. Pre-filter: skip obvious trash (Bankr, no socials, etc.)
+        3. Batch DexScreener lookup for survivors
+        4. Full scoring pipeline for tokens with DEX data
+        5. Telegram alert for gems above threshold
+        """
+        # Small initial delay so poll loops can populate the DB
         await asyncio.sleep(5)
+        recheck_delay = self.cfg.filtering.recheck_delay_seconds
 
         while not self._shutdown.is_set():
             try:
                 async with self._session_factory() as session:
+                    from datetime import datetime, timezone, timedelta
                     from sqlalchemy import select
 
+                    # Only evaluate tokens that are old enough for
+                    # DexScreener to have indexed them
+                    cutoff = datetime.now(timezone.utc) - timedelta(seconds=recheck_delay)
                     stmt = (
                         select(Token)
                         .where(Token.quality_score.is_(None))
-                        .order_by(Token.discovered_at.asc())
-                        .limit(20)
+                        .where(Token.discovered_at <= cutoff)
+                        .order_by(
+                            # Champagne tokens first (priority queue)
+                            Token.is_champagne.desc(),
+                            Token.discovered_at.asc(),
+                        )
+                        .limit(30)  # Match DexScreener batch size
                     )
                     result = await session.execute(stmt)
                     tokens = list(result.scalars().all())
 
+                    if not tokens:
+                        # Nothing to process
+                        try:
+                            await asyncio.wait_for(
+                                self._shutdown.wait(), timeout=10,
+                            )
+                            break
+                        except asyncio.TimeoutError:
+                            continue
+
+                    # Step 1: Pre-filter
+                    candidates: list[Token] = []
                     for token in tokens:
+                        passed, reason = self._filter.pre_filter(token)
+                        if not passed:
+                            # Mark as rejected so we don't re-process
+                            token.quality_score = 0.0
+                            token.filter_stage_reached = 0
+                            token.rejection_reason = reason
+                            logger.debug(
+                                "pre_filter.rejected",
+                                token=token.symbol,
+                                reason=reason,
+                            )
+                        else:
+                            candidates.append(token)
+
+                    if candidates:
+                        logger.info(
+                            "eval.batch",
+                            total=len(tokens),
+                            passed_prefilter=len(candidates),
+                            champagne=sum(
+                                1 for t in candidates if t.is_champagne
+                            ),
+                        )
+
+                    # Step 2: Full scoring for candidates
+                    for token in candidates:
                         if self._shutdown.is_set():
                             break
 
@@ -139,15 +233,19 @@ class Tracker:
                         ctx = await self._resolver.resolve(token, session)
 
                         # Score
-                        filt_result = await self._filter.evaluate(token, session)
+                        filt_result = await self._filter.evaluate(
+                            token, session,
+                        )
 
                         # Notify if above threshold
                         if not filt_result.rejected and not token.alert_sent:
-                            sent = await self._notifier.notify(token, ctx, filt_result)
+                            sent = await self._notifier.notify(
+                                token, ctx, filt_result,
+                            )
                             if sent:
                                 token.alert_sent = True
 
-                        await session.commit()
+                    await session.commit()
 
             except Exception:
                 logger.exception("eval.error")

@@ -1,7 +1,7 @@
 """Traces Clanker tokens back to the original X tweet or Farcaster cast.
 
 Resolution strategies (tried in order):
-1. Parse social_media_urls from the Clanker API response
+1. Parse social_media_urls / socialLinks from the Clanker API response
 2. Scrape clanker.world/clanker/{address} token page for origin links
 3. DuckDuckGo fallback search: "$SYMBOL bankrbot site:x.com"
 
@@ -85,12 +85,30 @@ class ContextResolver:
 
     @staticmethod
     def _try_social_urls(token: Token) -> tuple[Optional[str], Optional[str]]:
+        """Extract origin URL from social_media_urls field.
+
+        Handles two formats:
+        - Legacy: JSON array of URL strings  ["https://x.com/..."]
+        - New socialLinks format stored as JSON array of dicts:
+          [{"name":"x","link":"https://x.com/..."}]
+        """
         if not token.social_media_urls:
             return None, None
         try:
-            urls: list[str] = json.loads(token.social_media_urls)
+            raw = json.loads(token.social_media_urls)
         except (json.JSONDecodeError, TypeError):
             return None, None
+
+        urls: list[str] = []
+        if isinstance(raw, list):
+            for item in raw:
+                if isinstance(item, str):
+                    urls.append(item)
+                elif isinstance(item, dict):
+                    # socialLinks format: {"name": "x", "link": "https://..."}
+                    link = item.get("link") or item.get("url") or ""
+                    if link:
+                        urls.append(link)
 
         for url in urls:
             if X_URL_RE.search(url):

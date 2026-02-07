@@ -10,6 +10,7 @@ database:
 clanker:
   base_url: "https://www.clanker.world/api"
   poll_interval_seconds: 30
+  champagne_poll_interval_seconds: 120   # Curated champagne tokens scan
   api_key: null            # x-api-key for authenticated endpoints
   page_size: 50
 
@@ -23,13 +24,19 @@ bankr:
 dexscreener:
   base_url: "https://api.dexscreener.com/latest/dex"
   rate_limit_per_minute: 60
+  batch_size: 30             # Max addresses per batch request (DexScreener cap)
 
 base_rpc:
   http_url: "https://mainnet.base.org"
   ws_url: null             # wss://... for real-time TokenCreated events
 
 filtering:
-  min_pool_liquidity_usd: 500
+  # ── Pre-filter (fast, before any API calls) ──────────
+  skip_bankr: true                    # Reject Bankr bot launches instantly
+  require_social_links: false         # Require at least one social link
+  champagne_auto_pass_stage1: true    # Champagne tokens skip Stage 1
+
+  # ── Stage 1: Instant reject gate ─────────────────────
   scam_keywords:
     - rug
     - scam
@@ -38,15 +45,33 @@ filtering:
     - ponzi
     - fake
     - drain
+
+  # ── Stage 2: DEX metrics thresholds ──────────────────
+  min_pool_liquidity_usd: 500
   min_mcap_usd: 1000
   min_volume_5m_usd: 100
   min_holders: 5
   min_buy_sell_ratio: 0.3
+
+  # ── Stage 3: Momentum detection ──────────────────────
+  min_buys_1h: 10                     # Minimum buy txns in last hour
+  price_surge_threshold_pct: 20       # % price jump = hot signal
+
+  # ── Stage 4: Smart money ─────────────────────────────
   smart_money_wallet_file: "data/smart_money_wallets.txt"
-  smart_money_weight: 2.0
-  context_quality_weight: 1.5
+
+  # ── Stage 5: Context quality ─────────────────────────
   require_origin_url: false
-  score_threshold: 0.55
+
+  # ── Scoring weights (must sum to ~1.0 ex. bonus) ─────
+  weight_metrics: 0.30
+  weight_momentum: 0.20
+  weight_smart_money: 0.20
+  weight_context: 0.15
+  weight_champagne_bonus: 0.15        # Additive bonus for champagne tokens
+
+  score_threshold: 0.45               # Minimum to trigger Telegram alert
+  recheck_delay_seconds: 300          # Wait before DEX lookup (index time)
 
 telegram:
   bot_token: null          # or set TELEGRAM_BOT_TOKEN env var

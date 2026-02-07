@@ -42,25 +42,39 @@ class Token(Base):
 
     # On-chain identity
     contract_address: Mapped[str] = mapped_column(
-        String(42), unique=True, nullable=False, index=True,
+        String(66), unique=True, nullable=False, index=True,
     )
     chain: Mapped[str] = mapped_column(String(20), default="base")
     deployer_address: Mapped[Optional[str]] = mapped_column(String(42))
-    pool_address: Mapped[Optional[str]] = mapped_column(String(42))
+    pool_address: Mapped[Optional[str]] = mapped_column(
+        String(66), comment="Can be bytes32 pool ID in clanker_v4",
+    )
 
     # Clanker metadata
     clanker_id: Mapped[Optional[int]] = mapped_column(Integer, unique=True, index=True)
     name: Mapped[Optional[str]] = mapped_column(String(256))
     symbol: Mapped[Optional[str]] = mapped_column(String(32))
     image_url: Mapped[Optional[str]] = mapped_column(Text)
+    description: Mapped[Optional[str]] = mapped_column(Text)
     requestor_address: Mapped[Optional[str]] = mapped_column(String(42))
 
-    # Social URLs from Clanker API
+    # Social URLs from Clanker API (JSON — socialLinks array)
     social_media_urls: Mapped[Optional[str]] = mapped_column(
-        Text, comment="JSON array of URLs provided by Clanker API",
+        Text, comment="JSON array of {name, link} objects from socialLinks",
     )
 
-    # Bankr attribution
+    # Clanker tags & classification
+    is_champagne: Mapped[bool] = mapped_column(
+        Boolean, default=False,
+        comment="Clanker 'champagne' tag — curated quality token",
+    )
+    is_verified: Mapped[bool] = mapped_column(Boolean, default=False)
+    launch_platform: Mapped[Optional[str]] = mapped_column(
+        String(30),
+        comment="'bankr' | 'clawnch' | 'farcaster' | 'direct' | 'unknown'",
+    )
+
+    # Bankr attribution (detected from description + deployer address)
     is_bankr_launch: Mapped[bool] = mapped_column(Boolean, default=False)
 
     # Quality scoring
@@ -95,6 +109,8 @@ class Token(Base):
         Index("ix_tokens_symbol", "symbol"),
         Index("ix_tokens_requestor", "requestor_address"),
         Index("ix_tokens_discovered", "discovered_at"),
+        Index("ix_tokens_champagne", "is_champagne"),
+        Index("ix_tokens_platform", "launch_platform"),
     )
 
     def __repr__(self) -> str:

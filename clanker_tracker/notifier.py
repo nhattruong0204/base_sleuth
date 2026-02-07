@@ -76,22 +76,38 @@ class TelegramNotifier:
     ) -> str:
         lines: list[str] = []
 
-        # Header
-        bankr_tag = " 🏦 Bankr" if token.is_bankr_launch else ""
-        lines.append(
-            f"🚀 <b>New Token Alert{bankr_tag}</b>\n"
-        )
+        # ── Header with badges ──────────────────────────────
+        badges: list[str] = []
+        if getattr(token, "is_champagne", False):
+            badges.append("🍾 Champagne")
+        if getattr(token, "is_verified", False):
+            badges.append("✅ Verified")
+        platform = getattr(token, "launch_platform", None)
+        if platform and platform != "unknown":
+            platform_emoji = {
+                "bankr": "🏦", "clawnch": "🐱", "farcaster": "🟣", "direct": "🔧",
+            }
+            badges.append(f"{platform_emoji.get(platform, '🔗')} {platform.title()}")
 
-        # Identity
+        badge_str = "  ".join(badges)
+        lines.append(f"🚀 <b>New Token Alert</b>")
+        if badge_str:
+            lines.append(badge_str)
+        lines.append("")
+
+        # ── Identity ────────────────────────────────────────
         lines.append(f"<b>{_esc(token.name or 'Unknown')}</b> (${_esc(token.symbol or '???')})")
-        lines.append(f"<code>{token.contract_address}</code>\n")
+        lines.append(f"<code>{token.contract_address}</code>")
+        lines.append("")
 
-        # Score
+        # ── Score & stage breakdown ─────────────────────────
         score_bar = self._score_bar(result.final_score)
         lines.append(f"Score: {score_bar} <b>{result.final_score:.0%}</b>")
 
-        # Stage breakdown
-        stage_names = ["Reject Gate", "Metrics", "Smart Money", "Context"]
+        stage_names = [
+            "Reject Gate", "DEX Metrics", "Momentum",
+            "Smart Money", "Context",
+        ]
         for i, sr in enumerate(result.stage_results):
             label = stage_names[i] if i < len(stage_names) else f"Stage {i+1}"
             emoji = "✅" if sr.passed else "❌"
@@ -99,7 +115,16 @@ class TelegramNotifier:
 
         lines.append("")
 
-        # Origin context
+        # ── DEX metrics snapshot (if available) ─────────────
+        if hasattr(result, "stage_results") and len(result.stage_results) > 1:
+            sr_metrics = result.stage_results[1]
+            reason = sr_metrics.reason
+            # The reason string contains key metrics — show raw
+            if "$" in reason or "liq" in reason.lower():
+                lines.append(f"📊 <i>{_esc(reason[:200])}</i>")
+                lines.append("")
+
+        # ── Origin context ──────────────────────────────────
         if ctx and ctx.origin_url:
             platform_label = {
                 "x": "𝕏 Tweet",
@@ -118,15 +143,13 @@ class TelegramNotifier:
 
         lines.append("")
 
-        # Trading links
+        # ── Trading links ───────────────────────────────────
         addr = token.contract_address
         lines.append("<b>Trade:</b>")
         lines.append(
             f'📊 <a href="https://dexscreener.com/base/{addr}">DexScreener</a>'
             f' | 🦄 <a href="https://app.uniswap.org/swap?chain=base&outputCurrency={addr}">Uniswap</a>'
         )
-
-        # Clanker link
         lines.append(
             f'🔍 <a href="https://www.clanker.world/clanker/{addr}">Clanker Page</a>'
         )
