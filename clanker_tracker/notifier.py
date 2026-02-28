@@ -14,6 +14,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Optional
 
+import httpx
 import structlog
 from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ParseMode
@@ -29,15 +30,72 @@ logger = structlog.get_logger(__name__)
 class TelegramNotifier:
     """Formats and sends Telegram alerts for qualifying tokens."""
 
+    _DEX_BASE = "https://api.dexscreener.com/latest/dex"
+
     def __init__(self, config: AppConfig) -> None:
         self.cfg = config.telegram
         self._bot: Optional[Bot] = None
         if self.cfg.bot_token:
             self._bot = Bot(token=self.cfg.bot_token)
+        self._http = httpx.AsyncClient(
+            timeout=10,
+            headers={"User-Agent": "BaseSleuth/1.0"},
+        )
 
     @property
     def enabled(self) -> bool:
         return self._bot is not None and self.cfg.chat_id is not None
+
+    # ------------------------------------------------------------------
+    # Live DexScreener data
+    # ------------------------------------------------------------------
+
+    async def _fetch_live_dex(self, token_address: str) -> dict | None:
+        """Fetch live mcap / FDV / liquidity from DexScreener.
+
+        Returns dict with keys: market_cap, fdv, liquidity, price
+        or None on failure.
+        """
+        if not token_address:
+            return None
+        url = f"{self._DEX_BASE}/tokens/{token_address}"
+        try:
+            resp = await self._http.get(url)
+            resp.raise_for_status()
+            pairs = resp.json().get("pairs") or []
+            if not pairs:
+                return None
+            pair = pairs[0]
+            return {
+                "market_cap": _safe_float(pair.get("marketCap")),
+                "fdv": _safe_float(pair.get("fdv")),
+                "liquidity": _safe_float((pair.get("liquidity") or {}).get("usd")),
+                "price": _safe_float(pair.get("priceUsd")),
+            }
+        except Exception as exc:
+            logger.debug("dex.live_fetch.failed", addr=token_address[:12], error=str(exc))
+            return None
+
+    @staticmethod
+    def _format_dex_line(dex: dict) -> str:
+        """Format a compact Market Cap / FDV / Liq line."""
+        parts: list[str] = []
+        mc = dex.get("market_cap")
+        fdv = dex.get("fdv")
+        liq = dex.get("liquidity")
+        price = dex.get("price")
+        if mc and mc > 0:
+            parts.append(f"MCap ${_fmt_number(mc)}")
+        if fdv and fdv > 0 and fdv != mc:
+            parts.append(f"FDV ${_fmt_number(fdv)}")
+        if liq and liq > 0:
+            parts.append(f"Liq ${_fmt_number(liq)}")
+        if price and price > 0:
+            if price >= 0.01:
+                parts.append(f"Price ${price:,.4f}")
+            else:
+                parts.append(f"Price ${price:.6g}")
+        return " · ".join(parts) if parts else ""
 
     async def notify(
         self,
@@ -58,7 +116,8 @@ class TelegramNotifier:
             logger.warning("telegram.disabled", reason="missing bot_token or chat_id")
             return False
 
-        message = self._format_message(token, ctx, result, nansen_buys=nansen_buys)
+        dex = await self._fetch_live_dex(token.contract_address)
+        message = self._format_message(token, ctx, result, nansen_buys=nansen_buys, dex=dex)
         buttons = self._build_alert_buttons(token)
 
         try:
@@ -88,6 +147,7 @@ class TelegramNotifier:
         result: FilterResult,
         *,
         nansen_buys: list[dict] | None = None,
+        dex: dict | None = None,
     ) -> str:
         lines: list[str] = []
 
@@ -115,6 +175,12 @@ class TelegramNotifier:
         # ── Identity ────────────────────────────────────────
         lines.append(f"<b>{_esc(token.name or 'Unknown')}</b> (${_esc(token.symbol or '???')})")
         lines.append(f"<code>{token.contract_address}</code>")
+
+        # ── Live market data ────────────────────────────────
+        if dex:
+            dex_line = self._format_dex_line(dex)
+            if dex_line:
+                lines.append(f"💰 {dex_line}")
         lines.append("")
 
         # ── Score & stage breakdown ─────────────────────────
@@ -309,6 +375,13 @@ class TelegramNotifier:
         # Contract address
         lines.append(f"CA: <code>{token_addr}</code>")
 
+        # Live market data
+        dex = await self._fetch_live_dex(token_addr)
+        if dex:
+            dex_line = self._format_dex_line(dex)
+            if dex_line:
+                lines.append(f"💰 {dex_line}")
+
         message = "\n".join(lines)
 
         buttons = InlineKeyboardMarkup([
@@ -412,6 +485,13 @@ class TelegramNotifier:
 
         lines.append(f"CA: <code>{addr}</code>")
 
+        # Live market data
+        dex = await self._fetch_live_dex(addr)
+        if dex:
+            dex_line = self._format_dex_line(dex)
+            if dex_line:
+                lines.append(f"💰 {dex_line}")
+
         message = "\n".join(lines)
 
         buttons = InlineKeyboardMarkup([
@@ -509,6 +589,14 @@ class TelegramNotifier:
         if token_addr:
             lines.append(f"CA: <code>{token_addr}</code>")
 
+        # Live market data
+        if token_addr:
+            dex = await self._fetch_live_dex(token_addr)
+            if dex:
+                dex_line = self._format_dex_line(dex)
+                if dex_line:
+                    lines.append(f"💰 {dex_line}")
+
         message = "\n".join(lines)
 
         buttons = InlineKeyboardMarkup([
@@ -562,3 +650,13 @@ def _fmt_number(value: float) -> str:
     if value >= 1_000:
         return f"{value / 1_000:.1f}K"
     return f"{value:,.0f}"
+
+
+def _safe_float(val) -> float | None:
+    """Safe float conversion for DexScreener values."""
+    if val is None:
+        return None
+    try:
+        return float(val)
+    except (ValueError, TypeError):
+        return None
