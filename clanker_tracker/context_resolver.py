@@ -44,7 +44,18 @@ class ContextResolver:
         """Attempt to resolve origin context for *token*.
 
         Always returns a TokenContext (persisted) — even if unresolved.
+        If a context row already exists for this token, return it as-is.
         """
+        from sqlalchemy import select
+
+        # Check for existing context first (avoids UniqueViolation on re-eval)
+        existing = await session.execute(
+            select(TokenContext).where(TokenContext.token_id == token.id)
+        )
+        existing_ctx = existing.scalar_one_or_none()
+        if existing_ctx is not None:
+            return existing_ctx
+
         ctx = TokenContext(token_id=token.id)
 
         # Strategy 1 — social_media_urls from API payload

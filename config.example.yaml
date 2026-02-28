@@ -51,15 +51,22 @@ filtering:
     - drain
 
   # ── Stage 2: DEX metrics thresholds ──────────────────
-  min_pool_liquidity_usd: 500
+  min_pool_liquidity_usd: 3000          # Raised from 1K — too many dead tokens
   min_mcap_usd: 1000
+  min_volume_1h_usd: 500                # Raised from 50 — need real volume
   min_volume_5m_usd: 100
   min_holders: 5
   min_buy_sell_ratio: 0.3
 
+  # ── Bot-buy spray detection ───────────────────────────
+  # Tokens with hundreds of tiny buys are bot-inflated trash.
+  # If buys_1h > threshold AND avg buy < max, flag as bot.
+  bot_buy_threshold: 250                # Trigger bot check above this many buys
+  bot_avg_buy_max_usd: 100              # Avg buy size below $100 = bot spray
+
   # ── Stage 3: Momentum detection ──────────────────────
-  min_buys_1h: 10                     # Minimum buy txns in last hour
-  price_surge_threshold_pct: 20       # % price jump = hot signal
+  min_buys_1h: 10                       # Minimum buy txns in last hour
+  price_surge_threshold_pct: 20         # % price jump = hot signal
 
   # ── Stage 4: Smart money ─────────────────────────────
   smart_money_wallet_file: "data/smart_money_wallets.txt"
@@ -67,15 +74,23 @@ filtering:
   # ── Stage 5: Context quality ─────────────────────────
   require_origin_url: false
 
-  # ── Scoring weights (must sum to ~1.0 ex. bonus) ─────
-  weight_metrics: 0.30
-  weight_momentum: 0.20
-  weight_smart_money: 0.20
-  weight_context: 0.15
-  weight_champagne_bonus: 0.15        # Additive bonus for champagne tokens
+  # ── Scoring weights ─────────────────────────────────
+  # Data-driven rebalance (Feb 2026 analysis of 88 alerts):
+  # - Metrics raised (2.0): liquidity + volume are real survival signals
+  # - Context lowered (0.3): social links alone don't predict success
+  # - Firehose penalty (0.70): firehose has 0% win rate historically
+  weight_metrics: 2.0                  # Primary signal (was 1.0)
+  weight_momentum: 1.5
+  weight_smart_money: 2.0
+  weight_context: 0.3                  # Social links not predictive (was 1.0)
+  weight_champagne_bonus: 0.15         # Additive bonus for champagne tokens
+  firehose_score_penalty: 0.70         # Multiply firehose scores by this
 
-  score_threshold: 0.45               # Minimum to trigger Telegram alert
-  recheck_delay_seconds: 300          # Wait before DEX lookup (index time)
+  score_threshold: 0.45                # Minimum to trigger alert (lowered — bot detection makes scores honest)
+  min_alert_mcap_usd: 50000            # Hard MCap floor
+  min_alert_liquidity_usd: 5000        # Hard liquidity floor at alert time
+  duplicate_symbol_cooldown_seconds: 7200  # Don't alert same symbol within 2h
+  recheck_delay_seconds: 300           # Wait before DEX lookup (index time)
 
 # ── Breakout Scanner — delayed mover detection ───────────
 # Finds tokens that launched days ago but are NOW gaining momentum.
@@ -89,7 +104,7 @@ breakout:
   min_buys_1h: 20                      # Min buy txns in last hour
   min_price_change_1h_pct: 50          # Min 1h price change % (OR with buys)
   max_age_days: 14                     # Ignore tokens older than 2 weeks
-  breakout_score_bonus: 0.10           # Flat bonus added to weighted score
+  breakout_score_bonus: 0.05           # Flat bonus added to weighted score (reduced from 0.10)
   rescan_cooldown_seconds: 3600        # Don't re-check same token within 1h
 
 # ── Backfill — catch recent tokens on first startup ──────
@@ -123,6 +138,105 @@ gainers:
   max_age_days: 7                      # Ignore tokens older than 1 week
   gainer_score_bonus: 0.05             # Flat bonus added to weighted score
   rescan_cooldown_seconds: 1800        # Don't re-check same token within 30 min
+
+# ── PID Feedback Loop — self-improving alert quality ─────
+# Re-checks alerted tokens at 1h/6h/24h to classify outcomes.
+# Uses a PID-style controller to auto-adjust score_threshold
+# based on the rolling gem/dead ratio.
+pid:
+  enabled: true
+  check_interval_seconds: 300          # How often to run outcome checks (5 min)
+  check_windows:                       # Re-check at these intervals after alert
+    - 3600                             # 1 hour
+    - 21600                            # 6 hours
+    - 86400                            # 24 hours
+  check_tolerance_seconds: 600         # ±10 min tolerance for check windows
+
+  # Outcome classification
+  gem_mcap_multiplier: 2.0             # MCap must 2x to be classified 'gem'
+  dead_liq_threshold_usd: 500          # Liquidity below $500 = 'dead'
+
+  # Auto-tune (PID controller)
+  auto_tune_enabled: true
+  target_gem_rate: 0.25                # Target: 25% of alerts should be gems
+  threshold_adjust_step: 0.01          # Adjust by 0.01 per cycle
+  threshold_min: 0.40                  # Never go below this threshold
+  threshold_max: 0.60                  # Never go above this (must be < firehose_penalty)
+  lookback_hours: 48                   # Rolling window for outcome ratio
+  min_samples: 10                      # Need 10+ classified outcomes before tuning
+  no_alert_decay_hours: 6              # Dead-man's switch: auto-lower threshold if no alerts for 6h
+
+# ── Arkham Intel — Smart Wallet Tracking ──────────────────
+# Integrates with Arkham Intel API to discover and monitor
+# profitable wallets tagged 'fomo-user' on Base chain.
+# Generates alerts when tracked wallets buy new tokens,
+# and conviction signals when they buy tokens in our DB.
+arkham:
+  enabled: false                       # Set to true once API key is configured
+  api_key: null                        # or set ARKHAM_API_KEY env var
+  base_url: "https://api.arkm.com"
+  tag_id: "fomo-user"                  # Arkham tag for wallet discovery
+
+  # Wallet sync settings
+  wallet_sync_interval_seconds: 3600   # Re-sync wallet performance (1h)
+  max_wallets: 200                     # Cap on tracked wallets
+
+  # Profitability thresholds (PnL % to qualify as profitable)
+  min_profit_pct_1d: 5.0               # Min 1-day PnL %
+  min_profit_pct_7d: 10.0              # Min 7-day PnL %
+  min_profit_pct_30d: 20.0             # Min 30-day PnL %
+  min_profitable_periods: 1            # Must be profitable in at least N periods
+
+  # Swap monitoring
+  swap_poll_interval_seconds: 60       # How often to check for new swaps
+  min_swap_usd: 100.0                  # Ignore swaps below this USD value
+
+  # Conviction alerts (wallet buys token already in our DB)
+  conviction_enabled: true
+  conviction_min_wallets: 1            # Min tracked wallets to trigger conviction
+  conviction_score_bonus: 0.20         # Score bonus for conviction tokens
+
+  # Rate limiting
+  rate_limit_per_second: 15            # Standard API rate limit
+  heavy_endpoint_delay: 1.1            # Delay for /swaps, /transfers (seconds)
+
+# ── BaseScan Wallet Monitor ─────────────────────────────
+# On-chain wallet monitoring via BaseScan API.
+# Polls ERC-20 transfers for tracked wallets and detects
+# buys from DEX routers. Independent of Arkham integration.
+# Wallets loaded from data/smart_money_wallets.txt + wallets.txt.
+wallet_monitor:
+  enabled: true                                # Enable/disable wallet watch loop
+  basescan_api_url: "https://api.basescan.org/api"
+  basescan_api_key: null                       # Optional; or set BASESCAN_API_KEY env var
+  wallet_file: "data/smart_money_wallets.txt"  # Machine-readable wallet list
+  poll_interval_seconds: 60                    # How often to poll per wallet batch
+  lookback_blocks: 150                         # ~5 minutes of Base blocks on first run
+  min_usd_value: 50.0                          # Ignore transfers below this USD value
+  weth_address: "0x4200000000000000000000000000000000000006"
+  stable_addresses:                            # Outgoing stables = buy signal
+    - "0x4200000000000000000000000000000000000006"  # WETH
+    - "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913"  # USDC
+    - "0x6b175474e89094c44da98b954eedeac495271d0f"  # DAI
+    - "0xd9aaec86b65d86f6a7b5b1b0c42ffa531710b6ca"  # USDbC
+  conviction_score_bonus: 0.15                 # Score bonus for conviction tokens
+  batch_size: 5                                # Wallets per API batch
+  rate_delay_seconds: 0.25                     # Delay between API calls (rate limit)
+
+# ── NansenBot Listener (Telethon) ───────────────────────
+# Actively listens to @NansenBot using the Telegram client API.
+# Requires a Telegram user account with api_id + api_hash from
+# https://my.telegram.org.  The account must have an existing
+# chat with @NansenBot.  First run requires interactive login.
+nansen:
+  enabled: true                                # Enable Telethon NansenBot listener
+  api_id: null                                 # Telegram API ID (or NANSEN_API_ID env)
+  api_hash: null                               # Telegram API hash (or NANSEN_API_HASH env)
+  session_path: "data/nansen_session"          # Telethon session file path (no .session ext)
+  bot_user_id: 1593218799                      # @NansenBot Telegram user ID
+  forward_alerts: false                        # Forward parsed signals as alerts
+  auto_add_wallets: true                       # Auto-add wallets to watchlist + DB
+  base_only: true                              # Only process Base chain signals
 
 telegram:
   bot_token: null          # or set TELEGRAM_BOT_TOKEN env var

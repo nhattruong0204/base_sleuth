@@ -51,6 +51,7 @@ class FilterResult:
     rejected: bool = False
     rejection_reason: str = ""
     stage_reached: int = 0
+    metrics: Optional[TokenMetrics] = None  # DEX snapshot at eval time
 
 
 class TokenFilter:
@@ -67,11 +68,15 @@ class TokenFilter:
     def _load_smart_wallets(self) -> None:
         path = Path(self.cfg.smart_money_wallet_file)
         if path.exists():
-            self._smart_wallets = {
-                line.strip().lower()
-                for line in path.read_text().splitlines()
-                if line.strip() and not line.startswith("#")
-            }
+            self._smart_wallets = set()
+            for line in path.read_text().splitlines():
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                # Support "address alias" format — take only the address
+                addr = line.split()[0].lower()
+                if addr.startswith("0x") and len(addr) == 42:
+                    self._smart_wallets.add(addr)
             logger.info("smart_wallets.loaded", count=len(self._smart_wallets))
         else:
             logger.warning("smart_wallets.file_missing", path=str(path))
@@ -127,6 +132,7 @@ class TokenFilter:
             # Persist the metrics snapshot
             metrics.token_id = token.id
             session.add(metrics)
+        result.metrics = metrics  # Expose to caller for alert messages
 
         s2 = self._stage2_dex_metrics(token, metrics)
         result.stage_results.append(s2)
@@ -138,7 +144,7 @@ class TokenFilter:
         result.stage_reached = 3
 
         # ── Stage 4: Smart money ──
-        s4 = self._stage4_smart_money(metrics)
+        s4 = await self._stage4_smart_money(token, metrics, session)
         result.stage_results.append(s4)
         result.stage_reached = 4
 
@@ -199,47 +205,89 @@ class TokenFilter:
     def _stage2_dex_metrics(
         self, token: Token, metrics: Optional[TokenMetrics],
     ) -> StageResult:
-        """Score based on early trading activity from DexScreener."""
+        """Score based on early trading activity from DexScreener.
+
+        Includes bot-buy detection: tokens with hundreds/thousands of tiny
+        buys (avg < $100) are bot-sprayed and get penalised.
+        """
         if metrics is None:
             return StageResult(passed=True, score=0.1, reason="No DEX data yet")
 
         score = 0.0
         reasons: list[str] = []
 
-        # Liquidity
-        if metrics.liquidity_usd and metrics.liquidity_usd >= self.cfg.min_pool_liquidity_usd:
-            score += 0.30
-        else:
-            reasons.append(f"liq ${metrics.liquidity_usd or 0:,.0f}")
+        liq = metrics.liquidity_usd or 0
+        mcap = metrics.market_cap_usd or 0
+        vol_1h = metrics.volume_1h_usd or 0
+        buys = metrics.buys_1h or 0
+        sells = metrics.sells_1h or 0
+        total_txns = buys + sells
 
-        # Market cap
-        if metrics.market_cap_usd and metrics.market_cap_usd >= self.cfg.min_mcap_usd:
-            score += 0.20
+        # ── Bot-buy spray detection ──
+        # Real tokens: 20-100 buys/1h with avg $200+.
+        # Bot-sprayed: 300-2000+ buys/1h with avg <$100.
+        avg_buy = vol_1h / buys if buys > 0 else 0
+        is_bot_spray = (
+            buys >= self.cfg.bot_buy_threshold
+            and avg_buy < self.cfg.bot_avg_buy_max_usd
+        )
+        if is_bot_spray:
+            reasons.append(
+                f"BOT SPRAY {buys} buys avg ${avg_buy:.0f}"
+            )
+            return StageResult(
+                passed=True,
+                score=round(0.05, 3),
+                reason="; ".join(reasons),
+            )
+
+        # ── Liquidity (primary signal) ──
+        if liq >= self.cfg.min_pool_liquidity_usd:
+            # Scale: $1K=0.15, $5K=0.20, $10K+=0.30
+            if liq >= 10_000:
+                score += 0.30
+            elif liq >= 5_000:
+                score += 0.20
+            else:
+                score += 0.15
+        else:
+            reasons.append(f"liq ${liq:,.0f}")
+
+        # ── Market cap ──
+        if mcap >= self.cfg.min_mcap_usd:
+            score += 0.15
         else:
             reasons.append("low mcap")
 
-        # 1h volume
-        if metrics.volume_1h_usd and metrics.volume_1h_usd >= self.cfg.min_volume_1h_usd:
-            score += 0.25
+        # ── Volume quality (1h) ──
+        if vol_1h >= self.cfg.min_volume_1h_usd:
+            score += 0.20
+            # Bonus for strong volume relative to liquidity (demand pressure)
+            if liq > 0 and vol_1h / liq > 0.5:
+                score += 0.10
+                reasons.append(f"vol/liq {vol_1h / liq:.1f}x")
         else:
-            reasons.append(f"vol1h ${metrics.volume_1h_usd or 0:,.0f}")
+            reasons.append(f"vol1h ${vol_1h:,.0f}")
 
-        # Buy/sell ratio (healthy markets have balanced or buy-heavy activity)
-        buys = metrics.buys_1h or 0
-        sells = metrics.sells_1h or 0
-        total = buys + sells
-        if total > 0:
-            ratio = buys / total
+        # ── Buy/sell health ──
+        if total_txns > 0:
+            ratio = buys / total_txns
             if ratio >= self.cfg.min_buy_sell_ratio:
-                score += 0.15
+                score += 0.10
             else:
-                reasons.append(f"b/s ratio {ratio:.2f}")
+                reasons.append(f"b/s {ratio:.2f}")
         else:
             reasons.append("no txns")
 
-        # Holder bonus
+        # ── Holder bonus ──
         if metrics.holder_count and metrics.holder_count >= self.cfg.min_holders:
             score = min(score + 0.10, 1.0)
+
+        # ── Average buy size quality bonus ──
+        # Healthy buys: avg > $200 indicates real traders, not bots
+        if buys > 5 and avg_buy >= 200:
+            score = min(score + 0.05, 1.0)
+            reasons.append(f"avg buy ${avg_buy:.0f}")
 
         return StageResult(
             passed=True,
@@ -258,8 +306,9 @@ class TokenFilter:
 
         Key signals:
         - Volume velocity (5m volume relative to 1h)
-        - Active buying pressure (buy count in 1h)
+        - Active buying pressure (buy count in 1h) — capped, not infinite
         - Volume-to-liquidity ratio (demand pressure proxy)
+        - Organic activity signal (genuine buys without DexScreener profile)
         """
         if metrics is None:
             return StageResult(passed=True, score=0.0, reason="No metrics for momentum")
@@ -267,30 +316,51 @@ class TokenFilter:
         score = 0.0
         signals: list[str] = []
 
-        # Volume velocity: high 5m vol relative to 1h = accelerating
         vol_5m = metrics.volume_5m_usd or 0
         vol_1h = metrics.volume_1h_usd or 0
+        buys_1h = metrics.buys_1h or 0
+        liq = metrics.liquidity_usd or 0
+
+        # Volume velocity: high 5m vol relative to 1h = accelerating
         if vol_5m >= self.cfg.min_volume_5m_usd:
-            score += 0.25
+            score += 0.20
             if vol_1h > 0 and vol_5m / vol_1h > 0.3:
-                score += 0.15
+                score += 0.10
                 signals.append(f"vol accel {vol_5m / vol_1h:.0%}")
 
-        # Active buying pressure
-        buys_1h = metrics.buys_1h or 0
+        # Active buying pressure — capped to avoid rewarding bot spray
         if buys_1h >= self.cfg.min_buys_1h:
-            score += 0.20
+            # Diminishing returns: 5-30 buys = good, 30-100 = great, >100 = no extra
+            if buys_1h <= 100:
+                score += 0.20
+            else:
+                score += 0.15  # Slightly less for very high counts
             signals.append(f"{buys_1h} buys/1h")
 
         # Volume-to-liquidity ratio as demand pressure proxy
-        if metrics.liquidity_usd and metrics.liquidity_usd > 0:
-            vol_liq_ratio = vol_1h / metrics.liquidity_usd
+        if liq > 0:
+            vol_liq_ratio = vol_1h / liq
             if vol_liq_ratio > 1.0:
                 score += 0.25
                 signals.append(f"vol/liq {vol_liq_ratio:.1f}x")
             elif vol_liq_ratio > 0.3:
                 score += 0.15
                 signals.append(f"vol/liq {vol_liq_ratio:.1f}x")
+
+        # ── Organic gem signal ──
+        # Tokens with genuine trading activity but no DexScreener paid
+        # profile are community-driven — potential organic gems.
+        # (We detect this as vol > $5K, buys > 20, but token doesn't
+        # have a DexScreener profile. Boost captured at weighted score level.)
+        avg_buy = vol_1h / buys_1h if buys_1h > 0 else 0
+        if (
+            buys_1h >= 15
+            and vol_1h >= 3_000
+            and avg_buy >= 100
+            and liq >= 3_000
+        ):
+            score += 0.10
+            signals.append("organic activity")
 
         return StageResult(
             passed=True,
@@ -302,19 +372,80 @@ class TokenFilter:
     # Stage 4: Smart money
     # ------------------------------------------------------------------
 
-    def _stage4_smart_money(self, metrics: Optional[TokenMetrics]) -> StageResult:
-        """Score based on smart money wallet presence."""
+    async def _stage4_smart_money(
+        self, token: Token, metrics: Optional[TokenMetrics], session: AsyncSession,
+    ) -> StageResult:
+        """Score based on smart money wallet presence.
+
+        Checks two sources:
+        1. WalletSwap table — tracked wallets that bought this token
+        2. In-memory smart wallet set from data/smart_money_wallets.txt
+
+        Higher tier wallets (Tier 1/2) contribute more to the score.
+        """
         if not self._smart_wallets:
             return StageResult(passed=True, score=0.0, reason="No smart wallet list")
 
-        sm_count = metrics.smart_money_holders if metrics else 0
-        if sm_count and sm_count > 0:
-            score = min(0.25 + 0.25 * sm_count, 1.0)
+        sm_count = 0
+        tier1_count = 0
+        tier2_count = 0
+
+        # Check WalletSwap records for this token
+        if token.contract_address:
+            from sqlalchemy import select, func
+            from .models import WalletSwap, SmartWallet
+
+            token_addr = token.contract_address.lower()
+
+            # Count distinct tracked wallets that bought this token
+            swap_stmt = (
+                select(WalletSwap.wallet_address)
+                .where(WalletSwap.token_address == token_addr)
+                .where(WalletSwap.action == "buy")
+                .distinct()
+            )
+            swap_rows = (await session.execute(swap_stmt)).scalars().all()
+            smart_buyers = {
+                addr for addr in swap_rows if addr in self._smart_wallets
+            }
+            sm_count = len(smart_buyers)
+
+            # Get tier breakdown for scoring
+            if smart_buyers:
+                tier_stmt = (
+                    select(SmartWallet.tier, func.count(SmartWallet.id))
+                    .where(SmartWallet.address.in_(smart_buyers))
+                    .group_by(SmartWallet.tier)
+                )
+                tier_rows = (await session.execute(tier_stmt)).all()
+                for tier, count in tier_rows:
+                    if tier == 1:
+                        tier1_count = count
+                    elif tier == 2:
+                        tier2_count = count
+
+        # Also check old-style smart_money_holders from metrics
+        if metrics and metrics.smart_money_holders:
+            sm_count = max(sm_count, metrics.smart_money_holders)
+
+        if sm_count > 0:
+            # Tiered scoring: Tier 1 wallets worth more
+            base_score = min(0.20 + 0.20 * sm_count, 0.80)
+            tier_bonus = tier1_count * 0.10 + tier2_count * 0.05
+            score = min(base_score + tier_bonus, 1.0)
+
+            parts = [f"{sm_count} smart wallets"]
+            if tier1_count:
+                parts.append(f"{tier1_count} T1")
+            if tier2_count:
+                parts.append(f"{tier2_count} T2")
+
             return StageResult(
                 passed=True,
                 score=round(score, 3),
-                reason=f"{sm_count} smart wallets",
+                reason=", ".join(parts),
             )
+
         return StageResult(passed=True, score=0.0, reason="No smart money detected")
 
     # ------------------------------------------------------------------
@@ -375,7 +506,18 @@ class TokenFilter:
         s4: StageResult,
         s5: StageResult,
     ) -> float:
-        """Weighted combination of stages 2–5 (stage 1 is pass/fail gate)."""
+        """Weighted combination of stages 2–5 (stage 1 is pass/fail gate).
+
+        Weight philosophy (v3 — data-driven Feb 2026):
+        - Metrics (2.0): Liquidity + volume are the primary survival signals
+        - Momentum (1.5): Buying pressure confirms interest
+        - Smart money (2.0): Whale wallets (when data available)
+        - Context (0.3): Social links are baseline, NOT differentiators
+
+        Source-aware penalties:
+        - Firehose tokens get penalised (84% trash rate historically)
+        - Boost/trending tokens are pre-validated by DexScreener
+        """
         w_metrics = self.cfg.weight_metrics
         w_momentum = self.cfg.weight_momentum
         w_smart = self.cfg.weight_smart_money
@@ -388,6 +530,18 @@ class TokenFilter:
             + s4.score * w_smart
             + s5.score * w_context
         ) / total_weight
+
+        # ── Source-aware adjustment ──
+        source = getattr(token, "discovery_source", "") or ""
+        if source == "firehose":
+            # Firehose has 0% winners historically — heavy penalty
+            raw *= self.cfg.firehose_score_penalty
+        elif source in ("community_takeover",):
+            # Community takeovers have 0% trash — slight bonus
+            raw += 0.05
+        elif source.startswith("boost_top"):
+            # boost_top has 33% win rate — best source
+            raw += 0.03
 
         # Champagne bonus — curated tokens get a flat boost
         if token.is_champagne:

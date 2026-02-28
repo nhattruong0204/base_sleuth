@@ -6,10 +6,10 @@ This document tracks the evolution of the gem-hunting strategy based on paper tr
 
 ---
 
-## Current Strategy Version: 1.3
+## Current Strategy Version: 1.4
 
-**Last Updated**: 2026-02-08
-**Based on**: Live Clanker API data analysis (431K+ tokens, 38K/day)
+**Last Updated**: 2026-02-10
+**Based on**: Live Clanker API data analysis (431K+ tokens, 38K/day) + Arkham Intel smart wallet integration
 
 ### Active Scanning Strategy
 
@@ -198,6 +198,57 @@ Previously Telegram was one-way alerts only.
 - `clanker_tracker/notifier.py` (alert inline buttons)
 - `base-sleuth/SKILL.md` (interactive bot documentation)
 - `.github/copilot-instructions.md` (added bot_commands.py to key files)
+
+---
+
+### Iteration #4 — 2026-02-10 — Smart Wallet Tracking (Arkham Intel)
+
+**Strategy Change**: Integrated Arkham Intel API for smart wallet discovery and monitoring.
+
+#### What Changed
+1. **Arkham Intel Integration** (`arkham_client.py`):
+   - Fetches fomo-tagged wallets from Arkham Intel API
+   - Analyzes PnL at 1d/7d/30d via historical USD balance snapshots
+   - Classifies wallets into Tier 1 (3/3 profitable), 2, or 3
+   - Monitors wallet swaps via /swaps endpoint (heavy, 1 req/sec)
+
+2. **New DB Tables** (migration 004):
+   - `smart_wallets` — address, tier, PnL metrics, Arkham entity/label
+   - `wallet_swaps` — buy/sell records, tx_hash dedup, conviction tracking
+
+3. **Wallet Buy Alerts**:
+   - Telegram alert when tracked wallet buys any token on Base
+   - Shows wallet tier, PnL history, buy amount
+   - DexScreener + Uniswap + Arkham Explorer links
+
+4. **Conviction Alerts** (highest priority):
+   - Fires when a tracked wallet buys a token already in our DB
+   - Cross-references against tokens table for exact match
+   - Separate high-visibility alert format with 🔥 CONVICTION badge
+
+5. **Stage 4 Wired to DB**:
+   - `_stage4_smart_money()` now queries WalletSwap + SmartWallet tables
+   - Tiered scoring: T1 wallets worth more than T3
+   - Auto-updates `data/smart_money_wallets.txt` for compatibility
+
+6. **8 Async Loops** (was 6):
+   - Added: Wallet Sync (3600s) and Wallet Monitor (60s)
+   - All loops share the same shutdown event and backoff system
+
+7. **New /wallets Command**:
+   - Shows tracked wallet count, tier breakdown, 24h swaps/convictions
+   - Top 5 wallets with PnL and Arkham labels
+
+#### Files Modified
+- `config.py` (ArkhamConfig) + `config.example.yaml`
+- `models.py` (SmartWallet, WalletSwap)
+- `arkham_client.py` (NEW — ArkhamClient + WalletTracker)
+- `notifier.py` (notify_wallet_buy, notify_conviction)
+- `main.py` (wallet_sync_loop, wallet_monitor_loop)
+- `filters.py` (Stage 4 wired to DB)
+- `bot_commands.py` (/wallets command)
+- `alembic/versions/004_add_smart_wallets_and_swaps.py`
+- `base-sleuth/SKILL.md`, `strategy_evolution.md`
 
 ---
 

@@ -342,7 +342,7 @@ class ClankerClient:
             clanker_id = item.get("id")
             if clanker_id is None:
                 continue
-            # Check if already tracked
+            # Check if already tracked by clanker_id
             exists = await session.execute(
                 select(Token.id).where(Token.clanker_id == clanker_id)
             )
@@ -355,6 +355,21 @@ class ClankerClient:
                     .values(is_champagne=True)
                 )
                 continue
+
+            # Also check by contract_address to avoid IntegrityError
+            contract = (item.get("contract_address") or "").lower()
+            if contract:
+                ca_exists = await session.execute(
+                    select(Token.id).where(Token.contract_address == contract)
+                )
+                ca_existing_id = ca_exists.scalar_one_or_none()
+                if ca_existing_id is not None:
+                    await session.execute(
+                        Token.__table__.update()
+                        .where(Token.id == ca_existing_id)
+                        .values(is_champagne=True)
+                    )
+                    continue
 
             token = self._parse_token(item)
             token.is_champagne = True
@@ -880,6 +895,10 @@ class GainersScanner:
         self._http = http
         self._keyword_index = 0  # Rotate through search keywords
         self._recent_scans: dict[str, datetime] = {}
+        # Pre-build set for O(1) blacklist lookups
+        self._skip_set: set[str] = {
+            a.lower() for a in self.cfg.skip_addresses
+        }
 
     async def scan(self, session: AsyncSession) -> list[Token]:
         """Run one gainers scan cycle.
@@ -982,17 +1001,27 @@ class GainersScanner:
             if not addr:
                 continue
 
-            # Age filter
+            # Skip known blue-chip / infrastructure tokens
+            if addr in self._skip_set:
+                continue
+
+            # FDV cap — established tokens are not hidden gems
+            fdv = pair.get("fdv") or 0
+            if fdv > self.cfg.max_fdv_usd:
+                continue
+
+            # Age filter — reject if missing (established tokens often lack it)
             pair_created = pair.get("pairCreatedAt")
-            if pair_created:
-                try:
-                    created_dt = datetime.fromtimestamp(
-                        pair_created / 1000, tz=timezone.utc,
-                    )
-                    if (now - created_dt) > max_age:
-                        continue
-                except (ValueError, OSError):
-                    pass
+            if not pair_created:
+                continue
+            try:
+                created_dt = datetime.fromtimestamp(
+                    pair_created / 1000, tz=timezone.utc,
+                )
+                if (now - created_dt) > max_age:
+                    continue
+            except (ValueError, OSError):
+                continue
 
             # Quality filters
             liq = (pair.get("liquidity") or {}).get("usd") or 0
@@ -1047,6 +1076,8 @@ class GainersScanner:
                 continue
             addr = (item.get("tokenAddress") or "").lower()
             if not addr:
+                continue
+            if addr in self._skip_set:
                 continue
             results.append({
                 "address": addr,

@@ -50,6 +50,8 @@ services:
     volumes:
       # Mount config.yaml for runtime overrides (optional)
       - ./config.yaml:/app/config.yaml:ro
+      # Mount data directory (wallet lists, nansen wallets)
+      - ./data:/app/data
       # Persist logs
       - ./logs:/app/logs
 

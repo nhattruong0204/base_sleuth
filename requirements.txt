@@ -20,6 +20,9 @@ lxml>=5.0                 # Fast HTML parser for BS4
 # Telegram
 python-telegram-bot>=21.0,<22.0
 
+# Telegram client API (for NansenBot listener)
+telethon>=1.36
+
 # Logging
 structlog>=24.0
 

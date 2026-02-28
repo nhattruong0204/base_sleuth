@@ -35,10 +35,13 @@ from telegram.ext import (
     CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
+    MessageHandler,
+    filters,
 )
 from sqlalchemy import func, select
 
-from .models import Token, TokenContext, TokenMetrics
+from .models import AlertOutcome, SmartWallet, Token, TokenContext, TokenMetrics, WalletSwap
+from .nansen_listener import NansenIngestor, parse_nansen_message
 
 if TYPE_CHECKING:
     from .main import Tracker
@@ -70,6 +73,11 @@ def _main_menu_keyboard() -> InlineKeyboardMarkup:
             InlineKeyboardButton("📈 Breakouts", callback_data="breakouts"),
         ],
         [
+            InlineKeyboardButton("💰 PnL Report", callback_data="pnl_1"),
+            InlineKeyboardButton("🔬 Analysis", callback_data="analysis"),
+        ],
+        [
+            InlineKeyboardButton("👛 Wallets", callback_data="wallets"),
             InlineKeyboardButton("❓ Help", callback_data="help"),
         ],
     ])
@@ -101,6 +109,16 @@ def _back_keyboard() -> InlineKeyboardMarkup:
         [InlineKeyboardButton("⬅️ Back to Menu", callback_data="menu")],
     ])
 
+def _pnl_keyboard() -> InlineKeyboardMarkup:
+    """PnL timeframe switcher + back button."""
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("1D", callback_data="pnl_1"),
+            InlineKeyboardButton("7D", callback_data="pnl_7"),
+            InlineKeyboardButton("14D", callback_data="pnl_14"),
+        ],
+        [InlineKeyboardButton("\u2b05\ufe0f Back to Menu", callback_data="menu")],
+    ])
 
 # ──────────────────────────────────────────────────────────────────
 # Command handlers
@@ -181,6 +199,69 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
         text, parse_mode=ParseMode.HTML, reply_markup=_main_menu_keyboard(),
     )
+
+
+async def cmd_realpnl(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /realpnl <days> — real-time PnL report for alerted tokens."""
+    tracker: Tracker = context.bot_data["tracker"]
+
+    # Parse days argument (default 1)
+    days = 1
+    if context.args:
+        try:
+            days = int(context.args[0])
+            if days < 1:
+                days = 1
+            elif days > 30:
+                days = 30
+        except ValueError:
+            await update.message.reply_text(
+                "\u274c Usage: /realpnl <days>\nExample: /realpnl 7",
+                parse_mode=ParseMode.HTML,
+            )
+            return
+
+    await update.message.reply_text(
+        f"\u23f3 Fetching live prices for alerts in last {days} day(s)...\nThis may take a moment.",
+        parse_mode=ParseMode.HTML,
+    )
+
+    text = await _build_realpnl_text(tracker, days)
+    await update.message.reply_text(
+        text,
+        parse_mode=ParseMode.HTML,
+        reply_markup=_pnl_keyboard(),
+        disable_web_page_preview=True,
+    )
+
+
+async def cmd_wallets(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /wallets — smart wallet tracking summary."""
+    tracker: Tracker = context.bot_data["tracker"]
+    text = await _build_wallets_text(tracker)
+    await update.message.reply_text(
+        text, parse_mode=ParseMode.HTML,
+        reply_markup=_back_keyboard(),
+        disable_web_page_preview=True,
+    )
+
+
+async def cmd_analysis(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /analysis — full token profitability scan with live DexScreener."""
+    tracker: Tracker = context.bot_data["tracker"]
+    await update.message.reply_text(
+        "⏳ Running full profitability analysis...\nFetching live prices for all scored tokens. This may take 30-60s.",
+        parse_mode=ParseMode.HTML,
+    )
+    text = await _build_analysis_text(tracker)
+    # Telegram has a 4096-char limit; split if needed
+    for chunk in _split_message(text):
+        await update.message.reply_text(
+            chunk,
+            parse_mode=ParseMode.HTML,
+            reply_markup=_back_keyboard(),
+            disable_web_page_preview=True,
+        )
 
 
 # ──────────────────────────────────────────────────────────────────
@@ -281,6 +362,51 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await query.edit_message_text(
             text, parse_mode=ParseMode.HTML, reply_markup=_main_menu_keyboard(),
         )
+
+    elif data.startswith("pnl_"):
+        days = int(data.split("_")[1])
+        await query.edit_message_text(
+            f"\u23f3 Fetching live prices for alerts in last {days} day(s)...",
+            parse_mode=ParseMode.HTML,
+        )
+        text = await _build_realpnl_text(tracker, days)
+        await query.edit_message_text(
+            text,
+            parse_mode=ParseMode.HTML,
+            reply_markup=_pnl_keyboard(),
+            disable_web_page_preview=True,
+        )
+
+    elif data == "wallets":
+        text = await _build_wallets_text(tracker)
+        await query.edit_message_text(
+            text, parse_mode=ParseMode.HTML,
+            reply_markup=_back_keyboard(),
+            disable_web_page_preview=True,
+        )
+
+    elif data == "analysis":
+        await query.edit_message_text(
+            "⏳ Running full profitability analysis...\nFetching live prices for all scored tokens.",
+            parse_mode=ParseMode.HTML,
+        )
+        text = await _build_analysis_text(tracker)
+        chunks = _split_message(text)
+        # First chunk replaces the loading message
+        await query.edit_message_text(
+            chunks[0],
+            parse_mode=ParseMode.HTML,
+            reply_markup=_back_keyboard(),
+            disable_web_page_preview=True,
+        )
+        # Additional chunks sent as new messages
+        for chunk in chunks[1:]:
+            await query.message.reply_text(
+                chunk,
+                parse_mode=ParseMode.HTML,
+                reply_markup=_back_keyboard(),
+                disable_web_page_preview=True,
+            )
 
 
 # ──────────────────────────────────────────────────────────────────
@@ -573,6 +699,55 @@ def _build_config_text(tracker: Tracker) -> str:
     )
 
 
+async def _build_wallets_text(tracker: Tracker) -> str:
+    """Build smart wallet tracking summary."""
+    if not tracker._wallet_tracker or not tracker._arkham or not tracker._arkham.enabled:
+        return (
+            "👛 <b>Smart Wallet Tracking</b>\n\n"
+            "⚠️ Arkham Intel integration is <b>disabled</b>.\n\n"
+            "To enable:\n"
+            "1. Get an API key from intel.arkm.com\n"
+            "2. Set <code>arkham.api_key</code> in config.yaml\n"
+            "3. Set <code>arkham.enabled: true</code>\n"
+            "4. Restart the bot"
+        )
+
+    stats = await tracker._wallet_tracker.get_wallet_stats()
+
+    lines = [
+        "👛 <b>Smart Wallet Tracking</b>",
+        "",
+        f"Tag: <code>{tracker.cfg.arkham.tag_id}</code>",
+        f"Total wallets: <b>{stats['total']}</b>",
+        f"Active (profitable): <b>{stats['active']}</b>",
+        "",
+        f"🥇 Tier 1: {stats['tier1']}  |  🥈 Tier 2: {stats['tier2']}  |  🥉 Tier 3: {stats['tier3']}",
+        "",
+        f"📊 Swaps (24h): {stats['swaps_24h']}",
+        f"🔥 Convictions (24h): {stats['convictions_24h']}",
+        "",
+    ]
+
+    top = stats.get("top_wallets", [])
+    if top:
+        lines.append("<b>Top Tracked Wallets:</b>")
+        for w in top:
+            tier_emoji = {1: "🥇", 2: "🥈", 3: "🥉"}.get(w.tier, "🔘")
+            addr_short = w.address[:8] + "…" + w.address[-4:]
+            pnl_parts = []
+            if w.pnl_7d_pct is not None:
+                pnl_parts.append(f"7d: {w.pnl_7d_pct:+.1f}%")
+            if w.pnl_30d_pct is not None:
+                pnl_parts.append(f"30d: {w.pnl_30d_pct:+.1f}%")
+            pnl_str = " | ".join(pnl_parts) if pnl_parts else "N/A"
+            label = f" ({_esc(w.arkham_label)})" if w.arkham_label else ""
+            lines.append(
+                f"  {tier_emoji} <code>{addr_short}</code>{label} — {pnl_str}"
+            )
+
+    return "\n".join(lines)
+
+
 def _build_help_text() -> str:
     """Build help text with all available commands."""
     return (
@@ -586,6 +761,10 @@ def _build_help_text() -> str:
         "/gems — Recent gems above score threshold\n"
         "/top — Top 10 highest scored tokens\n"
         "/scan — Force scan (firehose, champagne, breakout)\n\n"
+        "<b>Analytics:</b>\n"
+        "/realpnl <i>days</i> — Real-time PnL report (1/7/14 days)\n"
+        "/analysis — Full token profitability scan (live prices)\n"
+        "/wallets — Smart wallet tracking summary\n\n"
         "<b>Browse:</b>\n"
         "🍾 Champagne — View champagne-tagged tokens\n"
         "📈 Breakouts — View breakout-detected tokens\n\n"
@@ -594,6 +773,483 @@ def _build_help_text() -> str:
         "/help — This help message\n\n"
         "<i>All buttons work from the main menu too!</i>"
     )
+
+
+# ──────────────────────────────────────────────────────────────────
+# Real-Time PnL builder
+# ──────────────────────────────────────────────────────────────────
+
+def _fmt(val: float) -> str:
+    """Compact number formatter for PnL display."""
+    if val >= 1_000_000_000:
+        return f"{val / 1_000_000_000:.2f}B"
+    if val >= 1_000_000:
+        return f"{val / 1_000_000:.2f}M"
+    if val >= 1_000:
+        return f"{val / 1_000:.1f}K"
+    return f"{val:,.0f}"
+
+
+async def _build_realpnl_text(tracker: Tracker, days: int) -> str:
+    """Build real-time PnL report by fetching live DexScreener data.
+
+    For each alerted token in the timeframe:
+    - Looks up alert-time FDV from AlertOutcome (or TokenMetrics fallback)
+    - Fetches live FDV from DexScreener
+    - Computes return multiplier = live_fdv / alert_fdv
+    - Simulates 1 SOL per trade with GMGN fee model (2.5% buy + 2.5% sell)
+    """
+    import httpx
+
+    now = datetime.now(timezone.utc)
+    cutoff = now - timedelta(days=days)
+    date_from = cutoff.strftime("%Y-%m-%d")
+    date_to = now.strftime("%Y-%m-%d")
+
+    # Step 1: Get all alerted tokens in the timeframe
+    async with tracker._session_factory() as session:
+        stmt = (
+            select(Token)
+            .where(Token.alert_sent.is_(True))
+            .where(Token.discovered_at >= cutoff)
+            .order_by(Token.discovered_at.desc())
+        )
+        result = await session.execute(stmt)
+        tokens = list(result.scalars().all())
+
+        if not tokens:
+            return (
+                f"📊 <b>Real-Time PnL</b> — Last {days} Day(s)\n\n"
+                f"📅 {date_from} to {date_to}\n\n"
+                "No alerts were sent in this timeframe."
+            )
+
+        # Step 2: Get alert-time FDV for each token from AlertOutcome
+        token_ids = [t.id for t in tokens]
+        ao_stmt = (
+            select(AlertOutcome)
+            .where(AlertOutcome.token_id.in_(token_ids))
+        )
+        ao_result = await session.execute(ao_stmt)
+        outcomes: dict[int, AlertOutcome] = {
+            ao.token_id: ao for ao in ao_result.scalars().all()
+        }
+
+        # Fallback: get latest TokenMetrics for tokens without AlertOutcome
+        for tok in tokens:
+            if tok.id not in outcomes:
+                m_stmt = (
+                    select(TokenMetrics)
+                    .where(TokenMetrics.token_id == tok.id)
+                    .order_by(TokenMetrics.snapshot_at.desc())
+                    .limit(1)
+                )
+                m_row = (await session.execute(m_stmt)).scalar_one_or_none()
+                if m_row:
+                    # Create a pseudo-outcome for uniform handling
+                    outcomes[tok.id] = AlertOutcome(
+                        token_id=tok.id,
+                        alert_fdv=m_row.fdv_usd,
+                        alert_mcap=m_row.market_cap_usd,
+                        alert_liq=m_row.liquidity_usd,
+                    )
+
+    # Step 3: Batch-fetch live DexScreener data
+    live_metrics: dict[str, dict] = {}
+    dex_url = tracker.cfg.dexscreener.base_url
+    batch_size = tracker.cfg.dexscreener.batch_size
+
+    for i in range(0, len(tokens), batch_size):
+        batch = tokens[i: i + batch_size]
+        addrs = ",".join(t.contract_address for t in batch if t.contract_address)
+        if not addrs:
+            continue
+        try:
+            resp = await tracker._http.get(
+                f"{dex_url}/tokens/{addrs}", timeout=15,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            seen: set[str] = set()
+            for pair in data.get("pairs") or []:
+                addr = pair.get("baseToken", {}).get("address", "").lower()
+                if addr and addr not in seen:
+                    seen.add(addr)
+                    live_metrics[addr] = {
+                        "fdv": float(pair.get("fdv") or 0),
+                        "mcap": float(pair.get("marketCap") or 0),
+                        "liq": float((pair.get("liquidity") or {}).get("usd", 0)),
+                    }
+        except Exception as exc:
+            logger.warning("realpnl.dex_fetch_error", error=str(exc))
+
+    # Step 4: Compute PnL for each token
+    SOL_PER_TRADE = 1.0
+    BUY_FEE_PCT = 2.5 / 100   # GMGN buy fee
+    SELL_FEE_PCT = 2.5 / 100  # GMGN sell fee
+
+    total_signals = len(tokens)
+    priced_ok = 0
+    rugged = 0
+    winners = 0
+    losers = 0
+    total_invested = 0.0
+    total_returned = 0.0
+    total_buy_fees = 0.0
+    total_sell_fees = 0.0
+
+    token_details: list[dict] = []
+
+    for tok in tokens:
+        ao = outcomes.get(tok.id)
+        alert_fdv = (ao.alert_fdv or 0) if ao else 0
+        addr = tok.contract_address.lower() if tok.contract_address else ""
+        live = live_metrics.get(addr)
+
+        if not live or live["fdv"] == 0:
+            # Token is rugged / dead — zero return
+            rugged += 1
+            total_invested += SOL_PER_TRADE
+            buy_fee = SOL_PER_TRADE * BUY_FEE_PCT
+            total_buy_fees += buy_fee
+            token_details.append({
+                "symbol": tok.symbol or "???",
+                "multiplier": 0.0,
+                "returned": 0.0,
+                "rugged": True,
+            })
+            continue
+
+        priced_ok += 1
+        live_fdv = live["fdv"]
+
+        # Multiplier: how much did FDV change
+        if alert_fdv > 0:
+            multiplier = live_fdv / alert_fdv
+        else:
+            multiplier = 1.0  # No alert FDV → assume break-even
+
+        # Simulate trade: invest 1 SOL, subtract buy fee
+        invested = SOL_PER_TRADE
+        buy_fee = invested * BUY_FEE_PCT
+        position_value = (invested - buy_fee) * multiplier
+
+        # Sell: subtract sell fee
+        sell_fee = position_value * SELL_FEE_PCT
+        returned = position_value - sell_fee
+
+        total_invested += invested
+        total_returned += returned
+        total_buy_fees += buy_fee
+        total_sell_fees += sell_fee
+
+        if multiplier >= 1.0:
+            winners += 1
+        else:
+            losers += 1
+
+        token_details.append({
+            "symbol": tok.symbol or "???",
+            "multiplier": multiplier,
+            "returned": returned,
+            "rugged": False,
+        })
+
+    # Step 5: Build the message
+    net_profit = total_returned - total_invested
+    net_pct = (net_profit / total_invested * 100) if total_invested > 0 else 0
+    total_fees = total_buy_fees + total_sell_fees
+    fee_pct = (total_fees / total_invested * 100) if total_invested > 0 else 0
+    gross_profit = net_profit + total_fees
+    gross_pct = (gross_profit / total_invested * 100) if total_invested > 0 else 0
+
+    win_rate = (winners / (priced_ok + rugged) * 100) if (priced_ok + rugged) > 0 else 0
+    pnl_emoji = "🟢" if net_profit >= 0 else "🔴"
+
+    lines = [
+        f"📊 <b>Real-Time PnL</b> — Last {days} Day(s)\n",
+        f"📅 {date_from} to {date_to}\n",
+        f"💰 <b>SOL Performance ({SOL_PER_TRADE} SOL/trade)</b>",
+        f"• Total Invested: {total_invested:.2f} SOL",
+        f"• Total Returned: {total_returned:.2f} SOL",
+        f"• {pnl_emoji} Net Profit: {net_profit:+.2f} SOL ({net_pct:+.1f}%)\n",
+        "💸 <b>Fee Breakdown (GMGN)</b>",
+        f"• Buy Fees (2.5%): {total_buy_fees:.2f} SOL",
+        f"• Sell Fees (2.5%): {total_sell_fees:.2f} SOL",
+        f"• Total Fees: {total_fees:.2f} SOL ({fee_pct:.1f}% of invested)",
+        f"• Gross Profit: {gross_profit:+.2f} SOL ({gross_pct:+.1f}%)\n",
+        "📈 <b>Overview</b>",
+        f"• Total Signals: {total_signals}",
+        f"• Priced OK: {priced_ok}",
+        f"• Rugged: {rugged} 💀\n",
+        "📊 <b>Win/Loss</b>",
+        f"• {pnl_emoji} Win Rate: {win_rate:.1f}%",
+        f"• Winners (≥1X): {winners}",
+        f"• Losers (&lt;1X): {losers}",
+    ]
+
+    # Top 5 winners
+    sorted_details = sorted(
+        [d for d in token_details if not d["rugged"]],
+        key=lambda d: d["multiplier"],
+        reverse=True,
+    )
+    top_winners = [d for d in sorted_details if d["multiplier"] >= 1.0][:5]
+    if top_winners:
+        lines.append("\n🏆 <b>Top Winners</b>")
+        for d in top_winners:
+            lines.append(
+                f"• ${_esc(d['symbol'])}: {d['multiplier']:.2f}X "
+                f"→ {d['returned']:.2f} SOL"
+            )
+
+    # Worst 5 losers (non-rugged)
+    worst_losers = [d for d in sorted_details if d["multiplier"] < 1.0][-5:]
+    if worst_losers:
+        lines.append("\n💀 <b>Worst Losers</b>")
+        for d in reversed(worst_losers):
+            lines.append(
+                f"• ${_esc(d['symbol'])}: {d['multiplier']:.2f}X "
+                f"→ {d['returned']:.2f} SOL"
+            )
+
+    return "\n".join(lines)
+
+
+# ──────────────────────────────────────────────────────────────────
+# Full profitability analysis builder
+# ──────────────────────────────────────────────────────────────────
+
+async def _build_analysis_text(tracker: Tracker) -> str:
+    """Full profitability analysis: fetch live DexScreener prices for ALL
+    tokens with recorded FDV, compare, and produce a rich summary."""
+    import json as _json
+
+    now = datetime.now(timezone.utc)
+
+    # Step 1: pull all tokens that have at least one FDV metric snapshot
+    async with tracker._session_factory() as session:
+        total_tokens_row = await session.scalar(select(func.count(Token.id)))
+        total_tokens = total_tokens_row or 0
+
+        # One row per token: earliest metric snapshot (= first score time)
+        stmt = (
+            select(
+                Token.id,
+                Token.symbol,
+                Token.name,
+                Token.contract_address,
+                Token.quality_score,
+                Token.alert_sent,
+                Token.is_champagne,
+                Token.is_breakout,
+                Token.discovery_source,
+                TokenMetrics.fdv_usd,
+                TokenMetrics.market_cap_usd,
+                TokenMetrics.liquidity_usd,
+            )
+            .join(TokenMetrics, TokenMetrics.token_id == Token.id)
+            .where(TokenMetrics.fdv_usd.isnot(None), TokenMetrics.fdv_usd > 0)
+            .order_by(Token.id, TokenMetrics.snapshot_at.asc())
+            .distinct(Token.id)
+        )
+        rows = (await session.execute(stmt)).all()
+
+    if not rows:
+        return (
+            "🔬 <b>Full Profitability Analysis</b>\n\n"
+            "No tokens with recorded FDV found in the database yet."
+        )
+
+    # Build lookup
+    token_data = []
+    for r in rows:
+        token_data.append({
+            "id": r[0], "symbol": r[1] or "???", "name": r[2] or "",
+            "address": r[3], "score": r[4] or 0,
+            "alerted": r[5], "champagne": r[6], "breakout": r[7],
+            "source": r[8] or "firehose",
+            "rec_fdv": r[9] or 0, "rec_mcap": r[10] or 0, "rec_liq": r[11] or 0,
+        })
+
+    # Step 2: batch-fetch live DexScreener data
+    dex_url = tracker.cfg.dexscreener.base_url
+    batch_size = tracker.cfg.dexscreener.batch_size
+    live: dict[str, dict] = {}
+
+    for i in range(0, len(token_data), batch_size):
+        batch = token_data[i : i + batch_size]
+        addrs = ",".join(t["address"] for t in batch if t["address"])
+        if not addrs:
+            continue
+        try:
+            resp = await tracker._http.get(f"{dex_url}/tokens/{addrs}", timeout=15)
+            resp.raise_for_status()
+            data = resp.json()
+            seen: set[str] = set()
+            for pair in data.get("pairs") or []:
+                addr = pair.get("baseToken", {}).get("address", "").lower()
+                if addr and addr not in seen:
+                    seen.add(addr)
+                    live[addr] = {
+                        "fdv": float(pair.get("fdv") or 0),
+                        "mcap": float(pair.get("marketCap") or 0),
+                        "liq": float((pair.get("liquidity") or {}).get("usd", 0)),
+                    }
+        except Exception as exc:
+            logger.warning("analysis.dex_error", error=str(exc))
+
+    # Step 3: classify
+    profitable = []
+    losers_list = []
+    dead = []
+
+    for t in token_data:
+        addr = t["address"].lower()
+        lv = live.get(addr)
+        if not lv or lv["fdv"] == 0:
+            dead.append(t)
+            continue
+        rec = t["rec_fdv"]
+        if rec <= 0:
+            continue
+        mult = lv["fdv"] / rec
+        entry = {**t, "live_fdv": lv["fdv"], "live_mcap": lv["mcap"],
+                 "live_liq": lv["liq"], "mult": mult, "pnl": (mult - 1) * 100}
+        if mult >= 1.0:
+            profitable.append(entry)
+        else:
+            losers_list.append(entry)
+
+    profitable.sort(key=lambda x: x["mult"], reverse=True)
+    losers_list.sort(key=lambda x: x["mult"])
+
+    n_total = len(token_data)
+    n_dead = len(dead)
+    n_prof = len(profitable)
+    n_loss = len(losers_list)
+    n_alive = n_prof + n_loss
+    big2x = [p for p in profitable if p["mult"] >= 2.0]
+    big5x = [p for p in profitable if p["mult"] >= 5.0]
+
+    # Alert breakdown
+    a_prof = [p for p in profitable if p["alerted"]]
+    a_loss = [l for l in losers_list if l["alerted"]]
+    a_dead = [d for d in dead if d["alerted"]]
+    n_alerted = len(a_prof) + len(a_loss) + len(a_dead)
+
+    pct = lambda n, d: f"{n/d*100:.1f}%" if d else "0%"
+
+    # Step 4: build message
+    lines = [
+        "🔬 <b>Full Token Profitability Analysis</b>\n",
+        f"📅 Scanned: {now.strftime('%Y-%m-%d %H:%M')} UTC",
+        f"Database: {total_tokens:,} total tokens | {n_total:,} with FDV data\n",
+        "<b>Overall Numbers</b>",
+        f"💀 Dead (zero DexScreener data): {n_dead} ({pct(n_dead, n_total)})",
+        f"📈 Profitable (≥1X): {n_prof} ({pct(n_prof, n_total)})",
+        f"📉 Losers (&lt;1X): {n_loss} ({pct(n_loss, n_total)})",
+        f"<b>Still alive: {n_alive} ({pct(n_alive, n_total)})</b>",
+        f"\n🏆 2X+ winners: {len(big2x)}",
+        f"🚀 5X+ rockets: {len(big5x)}\n",
+    ]
+
+    # Top profitable
+    top_n = profitable[:15]
+    if top_n:
+        lines.append("<b>Top Profitable Tokens</b>")
+        for i, t in enumerate(top_n, 1):
+            badges = ""
+            if t["alerted"]:
+                badges += "✅"
+            if t["champagne"]:
+                badges += "🍾"
+            if t["breakout"]:
+                badges += "📈"
+            lines.append(
+                f"{i}. {badges}<b>${_esc(t['symbol'][:15])}</b> "
+                f"${_fmt(t['rec_fdv'])}→${_fmt(t['live_fdv'])} "
+                f"<b>{t['mult']:.2f}X</b> ({t['pnl']:+.0f}%) "
+                f"liq ${_fmt(t['live_liq'])}"
+            )
+        lines.append("")
+
+    # Alert performance
+    lines.append(f"<b>Alert Performance</b> ({n_alerted} total alerts)")
+    lines.append(f"✅ Profitable: {len(a_prof)} ({pct(len(a_prof), n_alerted)})")
+    lines.append(f"🔴 Losers: {len(a_loss)} ({pct(len(a_loss), n_alerted)})")
+    lines.append(f"💀 Dead: {len(a_dead)} ({pct(len(a_dead), n_alerted)})")
+    lines.append("")
+
+    # Real winners among alerted
+    all_alerted_alive = sorted(a_prof + a_loss, key=lambda x: x["mult"], reverse=True)
+    if all_alerted_alive:
+        lines.append("<b>Alerted Tokens — Current Status</b>")
+        for t in all_alerted_alive[:20]:
+            emoji = "🟢" if t["mult"] >= 1 else "🔴"
+            badges = ""
+            if t["champagne"]:
+                badges += "🍾"
+            if t["breakout"]:
+                badges += "📈"
+            lines.append(
+                f"{emoji}{badges} <b>${_esc(t['symbol'][:13])}</b> "
+                f"${_fmt(t['rec_fdv'])}→${_fmt(t['live_fdv'])} "
+                f"{t['mult']:.2f}X ({t['pnl']:+.1f}%)"
+            )
+        for t in a_dead:
+            lines.append(
+                f"💀 <b>${_esc(t['symbol'][:13])}</b> "
+                f"${_fmt(t['rec_fdv'])}→DEAD"
+            )
+        lines.append("")
+
+    # Missed gems (2X+ but not alerted)
+    missed = [p for p in profitable if p["mult"] >= 1.5 and not p["alerted"]]
+    if missed:
+        lines.append(f"<b>Missed Gems</b> (≥1.5X but not alerted: {len(missed)})")
+        for t in missed[:10]:
+            badges = "🍾" if t["champagne"] else ""
+            lines.append(
+                f"⚠️{badges} <b>${_esc(t['symbol'][:13])}</b> "
+                f"score {t['score']:.2f} | {t['mult']:.2f}X "
+                f"${_fmt(t['rec_fdv'])}→${_fmt(t['live_fdv'])} "
+                f"({t['source']})"
+            )
+        lines.append("")
+
+    # Key insight
+    lines.append("<b>Key Insight</b>")
+    if n_alive > 0:
+        alive_pct = n_prof / n_alive * 100
+        lines.append(
+            f"Of {n_alive} alive tokens, {n_prof} ({alive_pct:.0f}%) are at/above recorded FDV. "
+        )
+    if big2x:
+        syms = ", ".join(f"${t['symbol']}" for t in big2x[:5])
+        lines.append(f"2X+ winners: {syms}")
+    if not big2x:
+        lines.append("No tokens hit 2X yet.")
+
+    return "\n".join(lines)
+
+
+def _split_message(text: str, limit: int = 4000) -> list[str]:
+    """Split a long message into chunks that fit Telegram's 4096-char limit."""
+    if len(text) <= limit:
+        return [text]
+    chunks = []
+    while text:
+        if len(text) <= limit:
+            chunks.append(text)
+            break
+        # Find last newline before the limit
+        cut = text.rfind("\n", 0, limit)
+        if cut <= 0:
+            cut = limit
+        chunks.append(text[:cut])
+        text = text[cut:].lstrip("\n")
+    return chunks
 
 
 # ──────────────────────────────────────────────────────────────────
@@ -666,6 +1322,94 @@ async def _handle_force_scan(query, tracker: Tracker, scan_type: str) -> None:
 
 
 # ──────────────────────────────────────────────────────────────────
+# NansenBot message handler
+# ──────────────────────────────────────────────────────────────────
+
+async def handle_nansen_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle incoming text messages — check if they're NansenBot alerts.
+
+    Triggers on:
+    1. Messages forwarded from NansenBot (forward_origin check)
+    2. Messages containing "Smart Alert" + "nansen.ai" patterns
+    3. Messages you manually paste from NansenBot
+
+    When a valid Base chain signal is found:
+    - Wallet + label saved to smart_wallets + watchlist
+    - Swap recorded in wallet_swaps
+    - Conviction check (token in our DB?)
+    - Alert forwarded to chat
+    """
+    tracker: Tracker = context.bot_data["tracker"]
+    msg = update.message
+    if not msg or not msg.text:
+        return
+
+    text = msg.text
+
+    # Quick filter — skip messages that don't look like Nansen alerts
+    if "Smart Alert" not in text and "nansen.ai" not in text:
+        return
+
+    nansen_cfg = tracker.cfg.nansen
+    if not nansen_cfg.enabled:
+        return
+
+    # Parse the Nansen message
+    signal = parse_nansen_message(text)
+    if not signal:
+        return
+
+    # Only process Base chain
+    if nansen_cfg.base_only and not signal.is_base:
+        return
+
+    logger.info(
+        "nansen.message_received",
+        wallet=signal.wallet_label or signal.wallet_address[:10],
+        token=signal.token_symbol,
+        usd=signal.usd_value,
+    )
+
+    # Process through pipeline
+    try:
+        ingestor = NansenIngestor(tracker._session_factory)
+        result = await ingestor.ingest(signal)
+
+        # Update filters' smart wallet set if new wallet added
+        if result["wallet_new"] and tracker._filter:
+            tracker._filter._smart_wallets.add(signal.wallet_address.lower())
+            if tracker._wallet_monitor:
+                tracker._wallet_monitor._wallet_addresses.add(signal.wallet_address.lower())
+                tracker._wallet_monitor._alias_map[signal.wallet_address.lower()] = signal.wallet_label
+
+        # Forward as alert
+        if nansen_cfg.forward_alerts and tracker._notifier:
+            await tracker._notifier.notify_nansen_signal(signal.to_dict())
+
+        # Send conviction alert if applicable
+        if result["conviction"] and tracker._notifier:
+            await tracker._notifier.notify_conviction(result["conviction"])
+
+        # Brief confirmation reply (optional, can be removed for stealth)
+        status_parts = []
+        if result["wallet_new"]:
+            status_parts.append(f"👛 New wallet: {signal.wallet_label or signal.wallet_address[:10]}")
+        if result["swap_new"]:
+            status_parts.append(f"💾 Swap recorded")
+        if result["conviction"]:
+            status_parts.append(f"🔥 CONVICTION — token in DB!")
+
+        if status_parts:
+            await msg.reply_text(
+                "✅ Nansen signal processed:\n" + "\n".join(status_parts),
+                parse_mode=ParseMode.HTML,
+            )
+
+    except Exception:
+        logger.exception("nansen.handler_error")
+
+
+# ──────────────────────────────────────────────────────────────────
 # Application builder
 # ──────────────────────────────────────────────────────────────────
 
@@ -690,9 +1434,21 @@ def build_telegram_app(bot_token: str, tracker: Tracker) -> Application:
     app.add_handler(CommandHandler("scan", cmd_scan))
     app.add_handler(CommandHandler("config", cmd_config))
     app.add_handler(CommandHandler("help", cmd_help))
+    app.add_handler(CommandHandler("realpnl", cmd_realpnl))
+    app.add_handler(CommandHandler("analysis", cmd_analysis))
+    app.add_handler(CommandHandler("wallets", cmd_wallets))
 
     # Register callback query handler for all inline buttons
     app.add_handler(CallbackQueryHandler(button_callback))
+
+    # NansenBot message listener — catches forwarded messages and
+    # any text matching Nansen alert patterns
+    if tracker.cfg.nansen.enabled:
+        app.add_handler(MessageHandler(
+            filters.TEXT & ~filters.COMMAND,
+            handle_nansen_message,
+        ))
+        logger.info("nansen_listener.registered")
 
     return app
 

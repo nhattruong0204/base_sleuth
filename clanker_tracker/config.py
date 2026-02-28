@@ -141,19 +141,41 @@ class FilteringConfig(BaseModel):
     min_mcap_usd: float = 1_000.0
 
     # ── Stage 2 — DEX metrics (DexScreener batch lookup) ──
-    min_pool_liquidity_usd: float = 1_000.0
-    min_volume_1h_usd: float = 50.0
+    min_pool_liquidity_usd: float = Field(
+        default=3_000.0,
+        description="Min liquidity to score positively (raised from $1K — too many dead)",
+    )
+    min_volume_1h_usd: float = Field(
+        default=500.0,
+        description="Min 1h volume for positive score (raised from $50)",
+    )
     min_buy_sell_ratio: float = 0.2
-    min_holders: int = 3
+    min_holders: int = Field(
+        default=5,
+        description="Min holders for bonus (raised from 3)",
+    )
     recheck_delay_seconds: int = Field(
         default=300,
         description="Wait N seconds after discovery before checking DEX metrics "
                     "(gives pools time to get indexed by DexScreener)",
     )
 
+    # ── Bot detection — catches bot-sprayed tokens ──
+    bot_buy_threshold: int = Field(
+        default=250,
+        description="If buys_1h exceeds this threshold, check avg buy size",
+    )
+    bot_avg_buy_max_usd: float = Field(
+        default=100.0,
+        description="If avg buy (vol/buys) < this $ with high buy count, flag as bot",
+    )
+
     # ── Stage 3 — momentum detection ──
     min_volume_5m_usd: float = 100.0
-    min_buys_1h: int = 5
+    min_buys_1h: int = Field(
+        default=10,
+        description="Min buys in 1h for momentum signal (raised from 5)",
+    )
     price_surge_threshold_pct: float = Field(
         default=50.0,
         description="24h price increase % to flag as surging",
@@ -168,21 +190,48 @@ class FilteringConfig(BaseModel):
     require_origin_url: bool = False
 
     # ── Scoring weights ──
-    weight_metrics: float = 1.0
+    # Data-driven rebalance (Feb 2026 analysis of 88 alerts):
+    # - Metrics up (2.0): liq + volume are the real survival signals
+    # - Context down (0.3): social links alone don't predict success
+    # - Added firehose penalty: 0% winners, 84% trash historically
+    weight_metrics: float = Field(
+        default=2.0,
+        description="DEX metrics weight (raised from 1.0 — primary signal)",
+    )
     weight_momentum: float = 1.5
     weight_smart_money: float = 2.0
-    weight_context: float = 1.0
+    weight_context: float = Field(
+        default=0.3,
+        description="Context weight (lowered from 1.0 — social links not predictive)",
+    )
     weight_champagne_bonus: float = Field(
         default=0.15,
         description="Flat score bonus for champagne-tagged tokens",
     )
+    firehose_score_penalty: float = Field(
+        default=0.70,
+        description="Multiply firehose scores by this factor (0-1). Firehose has 0% win rate.",
+    )
 
-    # ── Final threshold ──
+    # ── Alert gates ──
     score_threshold: float = Field(
         default=0.45,
         ge=0.0,
         le=1.0,
-        description="Minimum weighted score to trigger an alert",
+        description="Minimum weighted score to trigger an alert (lowered from 0.55 — "
+                    "new weights + bot detection make scores more honest)",
+    )
+    min_alert_mcap_usd: float = Field(
+        default=50_000.0,
+        description="Hard MCap floor at alert time — tokens below this never alert",
+    )
+    min_alert_liquidity_usd: float = Field(
+        default=5_000.0,
+        description="Hard liquidity floor at alert time — tokens below this never alert",
+    )
+    duplicate_symbol_cooldown_seconds: int = Field(
+        default=7200,
+        description="Don't alert on a symbol already alerted within this window (2h default)",
     )
 
 
@@ -224,7 +273,7 @@ class BreakoutConfig(BaseModel):
         description="Ignore tokens older than this (focus on recent launches)",
     )
     breakout_score_bonus: float = Field(
-        default=0.10,
+        default=0.05,
         description="Flat score bonus for tokens detected via breakout scanner",
     )
     rescan_cooldown_seconds: int = Field(
@@ -257,6 +306,30 @@ class GainersConfig(BaseModel):
         ],
         description="Rotating search keywords for DexScreener /latest/dex/search",
     )
+    skip_addresses: list[str] = Field(
+        default_factory=lambda: [
+            # Well-known blue-chip / infrastructure tokens on Base.
+            # These are NOT newly launched tokens and must never trigger alerts.
+            "0x4200000000000000000000000000000000000006",  # WETH
+            "0xcbb7c0000ab88b473b1f5afd9ef808440eed33bf",  # cbBTC
+            "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913",  # USDC
+            "0x50c5725949a6f0c72e6c4a641f24049a917db0cb",  # DAI
+            "0xd9aaec86b65d86f6a7b5b1b0c42ffa531710b6ca",  # USDbC
+            "0x2ae3f1ec7f1f5012cfeab0185bfc7aa3cf0dec22",  # cbETH
+            "0xb6fe221fe9eef5aba221c348ba20a1bf5e73624c",  # rETH
+            "0x940181a94a35a4569e4529a3cdfb74e38fd98631",  # AERO
+            "0x0b3e328455c4059eeb9e3f84b5543f74e24e7e1b",  # VIRTUAL
+            "0x532f27101965dd16442e59d40670faf5ebb142e4",  # BRETT
+            "0xac1bd2486aaf3b5c0fc3fd868558b082a531b2b4",  # TOSHI
+            "0x0578d8a44db98b23bf096a382e016e29a5ce0ffe",  # HIGHER
+            "0x768be13e1680b5ebe0024c42c896e3db59ec0149",  # MFER
+        ],
+        description="Known blue-chip / infrastructure token addresses to skip (lowercase)",
+    )
+    max_fdv_usd: float = Field(
+        default=50_000_000.0,
+        description="Skip tokens with FDV above this — clearly not hidden gems",
+    )
     min_liquidity_usd: float = Field(
         default=5_000.0,
         description="Minimum liquidity to consider a gainer candidate",
@@ -287,11 +360,295 @@ class GainersConfig(BaseModel):
     )
 
 
+class PIDConfig(BaseModel):
+    """PID feedback loop — self-improving alert quality.
+
+    After sending an alert, the bot re-checks the token at configurable
+    intervals to classify the outcome.  The rolling outcome ratio feeds
+    a PID controller that auto-adjusts score_threshold.
+    """
+
+    enabled: bool = Field(
+        default=True,
+        description="Enable the outcome-tracking PID feedback loop",
+    )
+    check_interval_seconds: int = Field(
+        default=300,
+        ge=60,
+        description="How often the outcome loop runs (seconds)",
+    )
+    check_windows: list[int] = Field(
+        default_factory=lambda: [3600, 21600, 86400],
+        description="Re-check at these offsets (1h, 6h, 24h) after alert",
+    )
+    check_tolerance_seconds: int = Field(
+        default=600,
+        description="Window tolerance — check if within ±tolerance of target",
+    )
+
+    # Outcome classification
+    gem_mcap_multiplier: float = Field(
+        default=2.0,
+        description="MCap must grow by this factor vs alert-time to be 'gem'",
+    )
+    dead_liq_threshold_usd: float = Field(
+        default=500.0,
+        description="Liquidity below this at any checkpoint → 'dead'",
+    )
+
+    # Auto-tune
+    auto_tune_enabled: bool = Field(
+        default=True,
+        description="Automatically adjust score_threshold based on outcome ratio",
+    )
+    target_gem_rate: float = Field(
+        default=0.25,
+        ge=0.05,
+        le=0.80,
+        description="Target proportion of alerts that should be gems",
+    )
+    threshold_adjust_step: float = Field(
+        default=0.01,
+        description="How much to adjust score_threshold per PID cycle",
+    )
+    threshold_min: float = Field(
+        default=0.40,
+        description="Never lower score_threshold below this",
+    )
+    threshold_max: float = Field(
+        default=0.60,
+        description="Never raise score_threshold above this (must be < firehose_penalty)",
+    )
+    lookback_hours: int = Field(
+        default=48,
+        description="Rolling window for PID outcome ratio calculation",
+    )
+    min_samples: int = Field(
+        default=10,
+        description="Don't auto-tune until at least this many outcomes are classified",
+    )
+    no_alert_decay_hours: int = Field(
+        default=6,
+        description="If no alerts sent in this many hours, lower threshold by one step "
+                    "per PID cycle to prevent runaway (dead-man's switch)",
+    )
+
+
+class ArkhamConfig(BaseModel):
+    """Arkham Intel API integration for smart wallet tracking.
+
+    Uses the Arkham Intel API to:
+    1. Fetch wallets tagged 'fomo-user' on Base
+    2. Analyze wallet performance (PnL over 1d/7d/30d)
+    3. Monitor wallet swaps for buy signals
+    4. Generate conviction alerts when wallets buy known tokens
+    """
+
+    enabled: bool = Field(
+        default=False,
+        description="Enable smart wallet tracking via Arkham Intel API",
+    )
+    api_key: Optional[str] = Field(
+        default=None,
+        description="Arkham Intel API key (required). Apply at https://intel.arkm.com/api",
+    )
+    base_url: str = "https://api.arkm.com"
+    tag_id: str = Field(
+        default="fomo-user",
+        description="Arkham tag ID to fetch wallets from",
+    )
+
+    # ── Wallet sync ──
+    wallet_sync_interval_seconds: int = Field(
+        default=3600,
+        ge=300,
+        description="How often to re-sync wallet list from Arkham (1h default)",
+    )
+    max_wallets: int = Field(
+        default=200,
+        ge=10,
+        description="Maximum number of wallets to track",
+    )
+
+    # ── Performance filtering ──
+    min_profit_pct_1d: float = Field(
+        default=5.0,
+        description="Minimum 1-day profit % to qualify as profitable wallet",
+    )
+    min_profit_pct_7d: float = Field(
+        default=10.0,
+        description="Minimum 7-day profit % to qualify",
+    )
+    min_profit_pct_30d: float = Field(
+        default=20.0,
+        description="Minimum 30-day profit % to qualify",
+    )
+    min_profitable_periods: int = Field(
+        default=1,
+        ge=1,
+        le=3,
+        description="Must be profitable in at least N of the 3 periods (1d/7d/30d)",
+    )
+
+    # ── Swap monitoring ──
+    swap_poll_interval_seconds: int = Field(
+        default=60,
+        ge=30,
+        description="How often to check tracked wallets for new swaps (1 min default)",
+    )
+    min_swap_usd: float = Field(
+        default=100.0,
+        description="Minimum swap size (USD) to consider as a buy signal",
+    )
+
+    # ── Conviction alerts ──
+    conviction_enabled: bool = Field(
+        default=True,
+        description="Send conviction alerts when tracked wallets buy DB tokens",
+    )
+    conviction_min_wallets: int = Field(
+        default=1,
+        ge=1,
+        description="Minimum wallet buys to trigger a conviction alert",
+    )
+    conviction_score_bonus: float = Field(
+        default=0.20,
+        description="Score bonus added when conviction signal fires",
+    )
+
+    # ── Rate limiting ──
+    rate_limit_per_second: int = Field(
+        default=15,
+        description="Max requests per second (Arkham allows 20, leave headroom)",
+    )
+    heavy_endpoint_delay: float = Field(
+        default=1.1,
+        description="Seconds between heavy endpoint calls (swaps, transfers)",
+    )
+
+
 class TelegramConfig(BaseModel):
     bot_token: Optional[str] = None
     chat_id: Optional[str] = None
     disable_notification: bool = False
     parse_mode: str = "HTML"
+
+
+class NansenConfig(BaseModel):
+    """NansenBot Telegram listener via Telethon.
+
+    Actively listens to @NansenBot (user ID 1593218799) using the
+    Telegram *client* API (Telethon).  Requires a user session with
+    api_id + api_hash from https://my.telegram.org.
+
+    The Telegram account must have an existing chat with @NansenBot.
+    On first run, Telethon will interactively ask for phone + code.
+    After that the session file is reused.
+    """
+
+    enabled: bool = Field(
+        default=False,
+        description="Enable NansenBot Telethon listener",
+    )
+    api_id: Optional[int] = Field(
+        default=None,
+        description="Telegram API ID from https://my.telegram.org (required)",
+    )
+    api_hash: Optional[str] = Field(
+        default=None,
+        description="Telegram API hash from https://my.telegram.org (required)",
+    )
+    session_path: str = Field(
+        default="data/nansen_session",
+        description="Path for the Telethon .session file (no extension)",
+    )
+    bot_user_id: int = Field(
+        default=1593218799,
+        description="@NansenBot Telegram user ID",
+    )
+    forward_alerts: bool = Field(
+        default=False,
+        description="Forward parsed Nansen signals as alerts (False = enrichment only)",
+    )
+    auto_add_wallets: bool = Field(
+        default=True,
+        description="Auto-add Nansen wallets to smart_wallets + watchlist",
+    )
+    base_only: bool = Field(
+        default=True,
+        description="Only process Base chain signals (ignore ETH/Polygon/etc)",
+    )
+
+
+class WalletMonitorConfig(BaseModel):
+    """On-chain wallet monitoring via BaseScan API.
+
+    Polls BaseScan for ERC-20 token transfers from tracked wallets.
+    When a watched wallet buys a token:
+    - Records the swap in wallet_swaps table
+    - Sends a Telegram alert
+    - If the token is in our DB: conviction signal → score boost
+    """
+
+    enabled: bool = Field(
+        default=True,
+        description="Enable on-chain wallet monitoring via BaseScan",
+    )
+    basescan_api_url: str = Field(
+        default="https://api.basescan.org/api",
+        description="BaseScan API base URL",
+    )
+    basescan_api_key: Optional[str] = Field(
+        default=None,
+        description="BaseScan API key (free tier: 5 req/s). Get from basescan.org",
+    )
+    wallet_file: str = Field(
+        default="data/smart_money_wallets.txt",
+        description="Path to wallet list file (one address per line)",
+    )
+    poll_interval_seconds: int = Field(
+        default=60,
+        ge=30,
+        description="How often to poll BaseScan for new transfers (seconds)",
+    )
+    lookback_blocks: int = Field(
+        default=150,
+        ge=10,
+        description="How many blocks back to check on each poll (~5 min at 2s/block)",
+    )
+    min_usd_value: float = Field(
+        default=50.0,
+        description="Minimum USD value of swap to consider (filter dust)",
+    )
+    weth_address: str = Field(
+        default="0x4200000000000000000000000000000000000006",
+        description="WETH contract on Base (used to identify buy direction)",
+    )
+    stable_addresses: list[str] = Field(
+        default_factory=lambda: [
+            "0x4200000000000000000000000000000000000006",  # WETH
+            "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913",  # USDC
+            "0x50c5725949a6f0c72e6c4a641f24049a917db0cb",  # DAI
+            "0xd9aaec86b65d86f6a7b5b1b0c42ffa531710b6ca",  # USDbC
+        ],
+        description="Base chain stablecoin/WETH addresses (outgoing = buy signal)",
+    )
+    conviction_score_bonus: float = Field(
+        default=0.15,
+        ge=0.0,
+        le=1.0,
+        description="Score bonus when a tracked wallet buys a token in our DB",
+    )
+    batch_size: int = Field(
+        default=5,
+        ge=1,
+        le=20,
+        description="Number of wallets to poll per cycle (BaseScan rate limit)",
+    )
+    rate_delay_seconds: float = Field(
+        default=0.25,
+        description="Delay between BaseScan API calls (respect rate limit)",
+    )
 
 
 class ScrapingConfig(BaseModel):
@@ -316,6 +673,10 @@ class AppConfig(BaseModel):
     filtering: FilteringConfig = Field(default_factory=FilteringConfig)
     breakout: BreakoutConfig = Field(default_factory=BreakoutConfig)
     gainers: GainersConfig = Field(default_factory=GainersConfig)
+    pid: PIDConfig = Field(default_factory=PIDConfig)
+    arkham: ArkhamConfig = Field(default_factory=ArkhamConfig)
+    wallet_monitor: WalletMonitorConfig = Field(default_factory=WalletMonitorConfig)
+    nansen: NansenConfig = Field(default_factory=NansenConfig)
     telegram: TelegramConfig = Field(default_factory=TelegramConfig)
     scraping: ScrapingConfig = Field(default_factory=ScrapingConfig)
     log_level: str = "INFO"
@@ -334,10 +695,14 @@ def _env_override(cfg: dict) -> dict:
         "DATABASE_URL": ("database", "url"),
         "BASE_RPC_WS": ("base_rpc", "ws_url"),
         "DB_POOL_SIZE": ("database", "pool_size"),
+        "ARKHAM_API_KEY": ("arkham", "api_key"),
+        "BASESCAN_API_KEY": ("wallet_monitor", "basescan_api_key"),
+        "NANSEN_API_ID": ("nansen", "api_id"),
+        "NANSEN_API_HASH": ("nansen", "api_hash"),
     }
     for env_var, path in mapping.items():
         value = os.environ.get(env_var)
-        if value is not None:
+        if value is not None and value != "":
             section, key = path
             cfg.setdefault(section, {})[key] = value
     return cfg

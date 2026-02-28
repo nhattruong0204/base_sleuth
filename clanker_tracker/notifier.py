@@ -21,7 +21,7 @@ from telegram.error import TelegramError
 
 from .config import AppConfig
 from .filters import FilterResult
-from .models import Token, TokenContext
+from .models import SmartWallet, Token, TokenContext
 
 logger = structlog.get_logger(__name__)
 
@@ -44,13 +44,21 @@ class TelegramNotifier:
         token: Token,
         ctx: Optional[TokenContext],
         result: FilterResult,
+        *,
+        nansen_buys: list[dict] | None = None,
     ) -> bool:
-        """Send a Telegram alert for *token*. Returns True on success."""
+        """Send a Telegram alert for *token*. Returns True on success.
+
+        Args:
+            nansen_buys: Optional list of dicts with keys
+                {wallet_address, wallet_label, usd_value, token_symbol, date}
+                from Nansen-tagged wallet_swaps for this token.
+        """
         if not self.enabled:
             logger.warning("telegram.disabled", reason="missing bot_token or chat_id")
             return False
 
-        message = self._format_message(token, ctx, result)
+        message = self._format_message(token, ctx, result, nansen_buys=nansen_buys)
         buttons = self._build_alert_buttons(token)
 
         try:
@@ -78,6 +86,8 @@ class TelegramNotifier:
         token: Token,
         ctx: Optional[TokenContext],
         result: FilterResult,
+        *,
+        nansen_buys: list[dict] | None = None,
     ) -> str:
         lines: list[str] = []
 
@@ -161,6 +171,30 @@ class TelegramNotifier:
             f'🔍 <a href="https://www.clanker.world/clanker/{addr}">Clanker Page</a>'
         )
 
+        # ── Nansen smart money activity ──────────────────────
+        if nansen_buys:
+            n_wallets = len(nansen_buys)
+            total_usd = sum(b.get("usd_value") or 0 for b in nansen_buys)
+            lines.append("")
+            if total_usd > 0:
+                lines.append(
+                    f"🧠 <b>Nansen Smart Money:</b> {n_wallets} wallet{'s' if n_wallets != 1 else ''}"
+                    f" bought ${_fmt_number(total_usd)}"
+                )
+            else:
+                lines.append(
+                    f"🧠 <b>Nansen Smart Money:</b> {n_wallets} wallet{'s' if n_wallets != 1 else ''}"
+                    f" bought this token"
+                )
+            # Show up to 3 individual wallets
+            for buy in nansen_buys[:3]:
+                label = buy.get("wallet_label") or buy["wallet_address"][:8] + "…"
+                usd = buy.get("usd_value")
+                usd_str = f" ${_fmt_number(usd)}" if usd and usd > 0 else ""
+                lines.append(f"  🟢 {_esc(label)}{usd_str}")
+            if n_wallets > 3:
+                lines.append(f"  … +{n_wallets - 3} more")
+
         # ── Time since launch ───────────────────────────────
         launched = getattr(token, "launched_at", None)
         if launched:
@@ -214,6 +248,301 @@ class TelegramNotifier:
             ],
         ])
 
+    # ------------------------------------------------------------------
+    # Wallet buy alert — tracked wallet buys a new token
+    # ------------------------------------------------------------------
+
+    async def notify_wallet_buy(
+        self,
+        buy: dict,
+        wallet: SmartWallet | None,
+    ) -> bool:
+        """Send alert when a tracked smart wallet buys a token."""
+        if not self.enabled:
+            return False
+
+        tier_emoji = {1: "🥇", 2: "🥈", 3: "🥉"}.get(
+            wallet.tier if wallet else 3, "🔘",
+        )
+
+        # Wallet label
+        label = ""
+        if wallet and wallet.arkham_label:
+            label = wallet.arkham_label
+        elif buy.get("wallet_alias"):
+            label = buy["wallet_alias"]
+        else:
+            label = buy["wallet_address"][:8] + "…" + buy["wallet_address"][-4:]
+
+        token_sym = buy.get("token_symbol") or "???"
+        usd_val = buy.get("usd_value") or 0
+        token_amount = buy.get("token_amount") or 0
+        token_addr = buy.get("token_address", "")
+        tx_hash = buy.get("tx_hash", "")
+        wallet_addr = buy["wallet_address"]
+
+        lines: list[str] = []
+
+        # Header
+        amount_str = f" ({_fmt_number(token_amount)} #{_esc(token_sym)})" if token_amount > 0 else ""
+        usd_str = f" ${_fmt_number(usd_val)}" if usd_val > 0 else ""
+        lines.append(
+            f"🚨 <b>Smart Alert</b>: {tier_emoji} Smart Money Buy"
+        )
+        lines.append(
+            f'🟢 <a href="https://basescan.org/address/{wallet_addr}">'
+            f"{_esc(label)}</a> bought{amount_str}{usd_str} of "
+            f"<b>#{_esc(token_sym)}</b>"
+        )
+
+        # Links
+        link_parts = [f"#Base"]
+        if tx_hash:
+            link_parts.append(f'<a href="https://basescan.org/tx/{tx_hash}">Txn</a>')
+        link_parts.append(f'<a href="https://basescan.org/address/{wallet_addr}">Wallet</a>')
+        link_parts.append(f'<a href="https://dexscreener.com/base/{token_addr}">Chart</a>')
+        link_parts.append(
+            f'<a href="https://app.uniswap.org/swap?chain=base&outputCurrency={token_addr}">Swap</a>'
+        )
+        lines.append(" | ".join(link_parts))
+
+        # Contract address
+        lines.append(f"CA: <code>{token_addr}</code>")
+
+        message = "\n".join(lines)
+
+        buttons = InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton(
+                    "📊 Chart",
+                    url=f"https://dexscreener.com/base/{token_addr}",
+                ),
+                InlineKeyboardButton(
+                    "🦄 Swap",
+                    url=f"https://app.uniswap.org/swap?chain=base&outputCurrency={token_addr}",
+                ),
+            ],
+        ])
+
+        try:
+            async with Bot(token=self.cfg.bot_token) as bot:
+                await bot.send_message(
+                    chat_id=self.cfg.chat_id,
+                    text=message,
+                    parse_mode=ParseMode.HTML,
+                    disable_web_page_preview=True,
+                    reply_markup=buttons,
+                )
+            logger.info(
+                "telegram.wallet_buy",
+                wallet=label,
+                token=token_sym,
+                usd=usd_val,
+            )
+            return True
+        except TelegramError as exc:
+            logger.error("telegram.wallet_buy.failed", error=str(exc))
+            return False
+
+    # ------------------------------------------------------------------
+    # Conviction alert — tracked wallet buys token already in our DB
+    # ------------------------------------------------------------------
+
+    async def notify_conviction(
+        self,
+        conviction: dict,
+    ) -> bool:
+        """Send high-priority conviction alert.
+
+        Fires when a profitable tracked wallet buys a token that
+        Base Sleuth already discovered or alerted on.
+        """
+        if not self.enabled:
+            return False
+
+        token: Token = conviction["token"]
+        wallet: SmartWallet | None = conviction.get("wallet")
+        buy: dict = conviction["buy"]
+        was_alerted = conviction.get("is_alerted", False)
+
+        tier_emoji = {1: "🥇", 2: "🥈", 3: "🥉"}.get(
+            wallet.tier if wallet else 3, "🔘",
+        )
+        alert_badge = "ALERTED ✓" if was_alerted else "TRACKED"
+
+        # Wallet label
+        label = ""
+        if wallet and wallet.arkham_label:
+            label = wallet.arkham_label
+        elif buy.get("wallet_alias"):
+            label = buy["wallet_alias"]
+        else:
+            label = buy["wallet_address"][:8] + "…" + buy["wallet_address"][-4:]
+
+        addr = token.contract_address
+        wallet_addr = buy["wallet_address"]
+        tx_hash = buy.get("tx_hash", "")
+        usd_val = buy.get("usd_value") or 0
+
+        lines: list[str] = []
+
+        # Header
+        lines.append(f"🔥 <b>CONVICTION</b> [{alert_badge}]")
+        usd_str = f" ${_fmt_number(usd_val)}" if usd_val > 0 else ""
+        lines.append(
+            f'{tier_emoji} <a href="https://basescan.org/address/{wallet_addr}">'
+            f"{_esc(label)}</a> bought{usd_str} of "
+            f"<b>{_esc(token.name or 'Unknown')}</b> (${_esc(token.symbol or '???')})"
+        )
+
+        # Score
+        if token.quality_score:
+            lines.append(f"⭐ Score: {token.quality_score:.0%}")
+
+        # Links
+        link_parts = [f"#Base"]
+        if tx_hash:
+            link_parts.append(f'<a href="https://basescan.org/tx/{tx_hash}">Txn</a>')
+        link_parts.append(f'<a href="https://dexscreener.com/base/{addr}">Chart</a>')
+        link_parts.append(
+            f'<a href="https://app.uniswap.org/swap?chain=base&outputCurrency={addr}">Swap</a>'
+        )
+        link_parts.append(f'<a href="https://basescan.org/address/{wallet_addr}">Wallet</a>')
+        lines.append(" | ".join(link_parts))
+
+        lines.append(f"CA: <code>{addr}</code>")
+
+        message = "\n".join(lines)
+
+        buttons = InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton(
+                    "📊 Chart",
+                    url=f"https://dexscreener.com/base/{addr}",
+                ),
+                InlineKeyboardButton(
+                    "🦄 Swap",
+                    url=f"https://app.uniswap.org/swap?chain=base&outputCurrency={addr}",
+                ),
+                InlineKeyboardButton(
+                    "👛 Wallet",
+                    url=f"https://basescan.org/address/{wallet_addr}",
+                ),
+            ],
+        ])
+
+        try:
+            async with Bot(token=self.cfg.bot_token) as bot:
+                await bot.send_message(
+                    chat_id=self.cfg.chat_id,
+                    text=message,
+                    parse_mode=ParseMode.HTML,
+                    disable_web_page_preview=True,
+                    reply_markup=buttons,
+                )
+            logger.info(
+                "telegram.conviction",
+                token=token.symbol,
+                wallet=label,
+                alerted=was_alerted,
+            )
+            return True
+        except TelegramError as exc:
+            logger.error("telegram.conviction.failed", error=str(exc))
+            return False
+
+    # ------------------------------------------------------------------
+    # Nansen signal alert — forwarded from NansenBot
+    # ------------------------------------------------------------------
+
+    async def notify_nansen_signal(
+        self,
+        signal: dict,
+    ) -> bool:
+        """Send alert when NansenBot detects a smart wallet buy on Base.
+
+        signal keys: wallet_address, wallet_label, token_address,
+                     token_symbol, usd_value, eth_value, token_amount,
+                     tx_hash, source
+        """
+        if not self.enabled:
+            return False
+
+        wallet_addr = signal.get("wallet_address", "")
+        label = signal.get("wallet_label", wallet_addr[:10])
+        token_sym = signal.get("token_symbol", "???")
+        token_addr = signal.get("token_address", "")
+        usd_val = signal.get("usd_value") or 0
+        eth_val = signal.get("eth_value") or 0
+        token_amount = signal.get("token_amount") or 0
+        tx_hash = signal.get("tx_hash", "")
+
+        lines: list[str] = []
+
+        # Header
+        lines.append("🔔 <b>Nansen Smart Alert</b>")
+
+        amount_parts: list[str] = []
+        if token_amount > 0:
+            amount_parts.append(f"{_fmt_number(token_amount)} #{_esc(token_sym)}")
+        if usd_val > 0:
+            amount_parts.append(f"${_fmt_number(usd_val)}")
+        if eth_val > 0:
+            amount_parts.append(f"{eth_val:.2f} #ETH")
+        amount_str = " · ".join(amount_parts) if amount_parts else f"#{_esc(token_sym)}"
+
+        lines.append(
+            f'🟢 <a href="https://basescan.org/address/{wallet_addr}">'
+            f"{_esc(label)}</a> bought {amount_str}"
+        )
+
+        # Links
+        link_parts = ["#Base"]
+        if tx_hash:
+            link_parts.append(f'<a href="https://basescan.org/tx/{tx_hash}">Txn</a>')
+        link_parts.append(f'<a href="https://dexscreener.com/base/{token_addr}">Chart</a>')
+        link_parts.append(
+            f'<a href="https://app.uniswap.org/swap?chain=base&outputCurrency={token_addr}">Swap</a>'
+        )
+        lines.append(" | ".join(link_parts))
+
+        if token_addr:
+            lines.append(f"CA: <code>{token_addr}</code>")
+
+        message = "\n".join(lines)
+
+        buttons = InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton(
+                    "📊 Chart",
+                    url=f"https://dexscreener.com/base/{token_addr}",
+                ),
+                InlineKeyboardButton(
+                    "🦄 Swap",
+                    url=f"https://app.uniswap.org/swap?chain=base&outputCurrency={token_addr}",
+                ),
+            ],
+        ])
+
+        try:
+            async with Bot(token=self.cfg.bot_token) as bot:
+                await bot.send_message(
+                    chat_id=self.cfg.chat_id,
+                    text=message,
+                    parse_mode=ParseMode.HTML,
+                    disable_web_page_preview=True,
+                    reply_markup=buttons,
+                )
+            logger.info(
+                "telegram.nansen_signal",
+                wallet=label,
+                token=token_sym,
+            )
+            return True
+        except TelegramError as exc:
+            logger.error("telegram.nansen_signal.failed", error=str(exc))
+            return False
+
 
 def _esc(text: str) -> str:
     """Escape HTML special characters for Telegram."""
@@ -222,3 +551,14 @@ def _esc(text: str) -> str:
         .replace("<", "&lt;")
         .replace(">", "&gt;")
     )
+
+
+def _fmt_number(value: float) -> str:
+    """Format a number compactly: 1_234_567 → '1.23M', 45_678 → '45.7K'."""
+    if value >= 1_000_000_000:
+        return f"{value / 1_000_000_000:.2f}B"
+    if value >= 1_000_000:
+        return f"{value / 1_000_000:.2f}M"
+    if value >= 1_000:
+        return f"{value / 1_000:.1f}K"
+    return f"{value:,.0f}"

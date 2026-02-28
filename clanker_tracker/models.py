@@ -224,6 +224,203 @@ class TokenMetrics(Base):
 
 
 # ---------------------------------------------------------------------------
+# AlertOutcome — PID feedback loop: track what happened AFTER we alerted
+# ---------------------------------------------------------------------------
+
+class AlertOutcome(Base):
+    """Tracks the outcome of each alert for PID self-improvement.
+
+    After alerting on a token, the bot re-checks it at 1h, 6h, 24h
+    to classify the outcome as 'gem', 'survivor', or 'dead'.
+    This feeds the PID controller that adjusts score_threshold.
+    """
+    __tablename__ = "alert_outcomes"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    token_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("tokens.id", ondelete="CASCADE"), unique=True,
+    )
+
+    # Metrics snapshot at the moment of alert
+    alert_score: Mapped[Optional[float]] = mapped_column(Float)
+    alert_mcap: Mapped[Optional[float]] = mapped_column(Float)
+    alert_fdv: Mapped[Optional[float]] = mapped_column(Float)
+    alert_liq: Mapped[Optional[float]] = mapped_column(Float)
+    alert_vol_1h: Mapped[Optional[float]] = mapped_column(Float)
+    alert_buys_1h: Mapped[Optional[int]] = mapped_column(Integer)
+    alerted_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(),
+    )
+
+    # 1-hour re-check
+    check_1h_mcap: Mapped[Optional[float]] = mapped_column(Float)
+    check_1h_liq: Mapped[Optional[float]] = mapped_column(Float)
+    check_1h_vol: Mapped[Optional[float]] = mapped_column(Float)
+    check_1h_buys: Mapped[Optional[int]] = mapped_column(Integer)
+    checked_1h_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+
+    # 6-hour re-check
+    check_6h_mcap: Mapped[Optional[float]] = mapped_column(Float)
+    check_6h_liq: Mapped[Optional[float]] = mapped_column(Float)
+    check_6h_vol: Mapped[Optional[float]] = mapped_column(Float)
+    check_6h_buys: Mapped[Optional[int]] = mapped_column(Integer)
+    checked_6h_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+
+    # 24-hour re-check
+    check_24h_mcap: Mapped[Optional[float]] = mapped_column(Float)
+    check_24h_liq: Mapped[Optional[float]] = mapped_column(Float)
+    check_24h_vol: Mapped[Optional[float]] = mapped_column(Float)
+    check_24h_buys: Mapped[Optional[int]] = mapped_column(Integer)
+    checked_24h_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+
+    # Final classification
+    outcome: Mapped[Optional[str]] = mapped_column(
+        String(20),
+        comment="'gem' (mcap 2x+) | 'survivor' (still alive) | 'dead' (liq < $500)",
+    )
+    mcap_change_pct: Mapped[Optional[float]] = mapped_column(
+        Float, comment="Best mcap vs alert mcap, as %",
+    )
+
+    # Relationship
+    token: Mapped["Token"] = relationship()
+
+    __table_args__ = (
+        Index("ix_outcomes_outcome", "outcome"),
+        Index("ix_outcomes_alerted", "alerted_at"),
+    )
+
+
+# ---------------------------------------------------------------------------
+# SmartWallet — tracked profitable wallets from Arkham Intel
+# ---------------------------------------------------------------------------
+
+class SmartWallet(Base):
+    """A wallet tracked for smart money signals.
+
+    Sourced from Arkham Intel 'fomo-user' tag, filtered by profitability.
+    Used for:
+    - Stage 4 smart money scoring (holder overlap)
+    - Real-time conviction alerts (wallet buys known token)
+    """
+    __tablename__ = "smart_wallets"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    address: Mapped[str] = mapped_column(
+        String(42), unique=True, nullable=False, index=True,
+    )
+    chain: Mapped[str] = mapped_column(String(20), default="base")
+
+    # Arkham metadata
+    tag: Mapped[Optional[str]] = mapped_column(
+        String(50), default="fomo-user",
+        comment="Arkham tag that identified this wallet",
+    )
+    arkham_entity: Mapped[Optional[str]] = mapped_column(
+        String(256), comment="Arkham entity name if labeled",
+    )
+    arkham_label: Mapped[Optional[str]] = mapped_column(
+        String(256), comment="Arkham label for the address",
+    )
+
+    # Tier classification (based on profitability)
+    tier: Mapped[Optional[int]] = mapped_column(
+        Integer, default=3,
+        comment="1=top performer, 2=consistent profit, 3=marginal",
+    )
+
+    # Performance metrics (USD flow-based PnL)
+    pnl_1d_pct: Mapped[Optional[float]] = mapped_column(Float)
+    pnl_7d_pct: Mapped[Optional[float]] = mapped_column(Float)
+    pnl_30d_pct: Mapped[Optional[float]] = mapped_column(Float)
+    balance_usd: Mapped[Optional[float]] = mapped_column(Float)
+    volume_usd: Mapped[Optional[float]] = mapped_column(
+        Float, comment="Total historical transaction volume in USD",
+    )
+
+    # Tracking state
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True)
+    profitable_periods: Mapped[Optional[int]] = mapped_column(
+        Integer, default=0,
+        comment="How many of 1d/7d/30d are profitable (0-3)",
+    )
+
+    # Timestamps
+    discovered_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(),
+    )
+    last_synced_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True),
+    )
+    last_activity_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True),
+    )
+
+    __table_args__ = (
+        Index("ix_smart_wallets_tier", "tier"),
+        Index("ix_smart_wallets_active", "is_active"),
+        Index("ix_smart_wallets_tag", "tag"),
+    )
+
+    def __repr__(self) -> str:
+        return f"<SmartWallet {self.address[:10]}… tier={self.tier}>"
+
+
+# ---------------------------------------------------------------------------
+# WalletSwap — recorded swaps from tracked wallets
+# ---------------------------------------------------------------------------
+
+class WalletSwap(Base):
+    """Records a swap (buy/sell) made by a tracked smart wallet.
+
+    Used for:
+    - Conviction alerts (wallet buys token in our DB → boost signal)
+    - Activity monitoring (wallet buying new tokens → new token alert)
+    """
+    __tablename__ = "wallet_swaps"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    wallet_address: Mapped[str] = mapped_column(
+        String(42), nullable=False, index=True,
+    )
+
+    # What was traded
+    token_address: Mapped[str] = mapped_column(String(66), nullable=False, index=True)
+    token_symbol: Mapped[Optional[str]] = mapped_column(String(256))
+    token_name: Mapped[Optional[str]] = mapped_column(String(256))
+
+    # Trade details
+    action: Mapped[str] = mapped_column(
+        String(10), comment="'buy' | 'sell'",
+    )
+    usd_value: Mapped[Optional[float]] = mapped_column(Float)
+    unit_value: Mapped[Optional[float]] = mapped_column(Float)
+
+    # Arkham reference
+    tx_hash: Mapped[Optional[str]] = mapped_column(String(66), unique=True)
+    block_timestamp: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True),
+    )
+
+    # Whether this triggered a conviction alert
+    conviction_sent: Mapped[bool] = mapped_column(Boolean, default=False)
+
+    # Timestamps
+    recorded_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(),
+    )
+
+    __table_args__ = (
+        Index("ix_wallet_swaps_token", "token_address"),
+        Index("ix_wallet_swaps_wallet_token", "wallet_address", "token_address"),
+        Index("ix_wallet_swaps_recorded", "recorded_at"),
+    )
+
+    def __repr__(self) -> str:
+        return f"<WalletSwap {self.wallet_address[:10]}… {self.action} {self.token_symbol}>"
+
+
+# ---------------------------------------------------------------------------
 # Engine / session helpers
 # ---------------------------------------------------------------------------
 

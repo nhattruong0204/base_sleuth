@@ -107,7 +107,7 @@ Breakout discovery endpoints (60 req/min each):
 
 ## Scanning Architecture
 
-The codebase runs **four concurrent async loops**:
+The codebase runs **eight concurrent async loops**:
 
 ### Loop 1 — Firehose (every 30s)
 ```
@@ -146,6 +146,34 @@ Pre-filter → Batch DexScreener → 5-Stage Score → Telegram Alert.
 Waits 300s after discovery before DEX lookup (indexing delay).
 ```
 
+### Loop 5 — PID Outcome Tracker (every 5m)
+```
+Re-checks alerted tokens at 1h/6h/24h with live DexScreener data.
+Classifies outcomes: gem (2x MCap), survivor, dead (<$500 liq).
+PID controller auto-tunes score_threshold based on gem/dead ratio.
+```
+
+### Loop 6 — Wallet Sync (every 3600s)
+```
+Syncs smart wallets from Arkham Intel API (fomo-user tag).
+Analyzes each wallet's performance via /history endpoint:
+  - Computes PnL at 1d, 7d, 30d time windows
+  - Classifies into Tier 1 (all profitable), 2, or 3
+  - Persists to smart_wallets table
+  - Updates data/smart_money_wallets.txt for Stage 4
+```
+
+### Loop 7 — Wallet Monitor (every 60s)
+```
+Polls Arkham /swaps endpoint for recent buys by tracked wallets.
+For each new buy above $100 USD:
+  1. Records swap in wallet_swaps table
+  2. Sends wallet buy alert via Telegram
+  3. Checks if token exists in our DB → conviction signal
+  4. Sends high-priority conviction alert if match found
+Heavy endpoint: 1 req/sec rate limit observed.
+```
+
 ### Deployment — 24/7 Docker Stack
 ```
 PostgreSQL 16 (asyncpg) for persistence — all tokens stored permanently.
@@ -170,14 +198,19 @@ Commands:
   /top             — Top 10 highest scored tokens
   /scan            — Force scan sub-menu (firehose/champagne/breakout/eval/all)
   /config          — View all filter settings and scoring weights
+  /realpnl <days>  — Real-time PnL report for alerted tokens
+  /analysis        — Full profitability scan with live DexScreener prices
+  /wallets         — Smart wallet tracking summary (tiers, PnL, convictions)
   /help            — Full command reference
 
 Inline Buttons:
-  Dashboard grid  → Status, Stats, Gems, Top, Force Scan, Config, Champagne, Breakouts
+  Dashboard grid  → Status, Stats, Gems, Top, Force Scan, Config, Champagne, Breakouts, Wallets
   Scan sub-menu   → Firehose Now, Champagne Now, Breakout Now, Eval Now, Scan All
   Alert buttons   → DexScreener link, Uniswap link, Clanker page, Dashboard
+  Wallet alerts   → DexScreener, Uniswap, Arkham Explorer
 
 Every alert message now has inline trading buttons (DexScreener, Uniswap, Clanker).
+Wallet buy alerts and conviction alerts have Arkham Explorer links.
 ```
 
 ---
@@ -231,9 +264,17 @@ Check if known profitable wallets are involved:
 
 | Signal | Detection | Impact |
 |--------|-----------|--------|
-| Smart money wallet match | On-chain address in `data/smart_money_wallets.txt` | Strong buy signal |
-| Wallet reputation tier | Tier 1/2/3 in `references/wallet_watchlist.md` | Confidence multiplier |
-| Early entry timing | Within first 5 mins of launch | Higher conviction |
+| Smart money wallet match | DB-backed SmartWallet table (synced from Arkham) | Strong buy signal |
+| Wallet reputation tier | Tier 1 (all periods profitable) / 2 / 3 | Confidence multiplier |
+| Conviction signal | Tracked wallet buys token already in our DB | Highest confidence — separate alert |
+| Multiple wallets | 2+ smart wallets holding same token | Compounding signal |
+
+**Arkham Intel Integration:**
+- Fetches wallets tagged 'fomo-user' from Arkham Intel API
+- Analyzes 1d/7d/30d PnL via historical USD balance snapshots
+- Monitors wallet swaps via /swaps endpoint for real-time buy detection
+- Sends wallet buy alerts and conviction alerts via Telegram
+- Auto-updates `data/smart_money_wallets.txt` for Stage 4 scoring
 
 ### Stage 5 — Context Quality (Weight: 15%)
 
@@ -469,7 +510,7 @@ Bankr launches are created via the Bankr Terminal Telegram bot. They:
 | `references/wallet_watchlist.md` | Smart money wallets (Base chain) with tracking |
 | `references/token_blacklist.md` | Deployers, tokens, and patterns to avoid |
 | `references/clanker_intel.md` | Live intelligence about Clanker ecosystem changes |
-| `data/smart_money_wallets.txt` | Machine-readable wallet list (loaded by filter Stage 4) |
+| `data/smart_money_wallets.txt` | Machine-readable wallet list (auto-synced from Arkham Intel, loaded by Stage 4) |
 
 ---
 
