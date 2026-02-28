@@ -50,6 +50,8 @@ services:
     volumes:
       # Mount config.yaml for runtime overrides (optional)
       - ./config.yaml:/app/config.yaml:ro
+      # Mount source code so restarts pick up code changes without rebuild
+      - ./clanker_tracker:/app/clanker_tracker:ro
       # Mount data directory (wallet lists, nansen wallets)
       - ./data:/app/data
       # Persist logs

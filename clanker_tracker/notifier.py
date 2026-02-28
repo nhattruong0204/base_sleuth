@@ -60,20 +60,29 @@ class TelegramNotifier:
             return None
         url = f"{self._DEX_BASE}/tokens/{token_address}"
         try:
-            resp = await self._http.get(url)
-            resp.raise_for_status()
+            async with httpx.AsyncClient(timeout=10) as client:
+                resp = await client.get(url)
+                resp.raise_for_status()
             pairs = resp.json().get("pairs") or []
             if not pairs:
+                logger.warning("dex.live_fetch.no_pairs", addr=token_address[:12])
                 return None
             pair = pairs[0]
-            return {
+            result = {
                 "market_cap": _safe_float(pair.get("marketCap")),
                 "fdv": _safe_float(pair.get("fdv")),
                 "liquidity": _safe_float((pair.get("liquidity") or {}).get("usd")),
                 "price": _safe_float(pair.get("priceUsd")),
             }
+            logger.info(
+                "dex.live_fetch.ok",
+                addr=token_address[:12],
+                mcap=result["market_cap"],
+                liq=result["liquidity"],
+            )
+            return result
         except Exception as exc:
-            logger.debug("dex.live_fetch.failed", addr=token_address[:12], error=str(exc))
+            logger.warning("dex.live_fetch.failed", addr=token_address[:12], error=str(exc))
             return None
 
     @staticmethod
