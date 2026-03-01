@@ -421,6 +421,67 @@ class WalletSwap(Base):
 
 
 # ---------------------------------------------------------------------------
+# PaperPosition — simulated trading positions
+# ---------------------------------------------------------------------------
+
+class PaperPosition(Base):
+    """Simulated paper trading position entered on every alert.
+
+    Tracks entry, SL/TP exits, and final PnL for measuring bot
+    profitability without risking real capital.
+    """
+    __tablename__ = "paper_positions"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    token_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("tokens.id", ondelete="CASCADE"),
+    )
+
+    # Entry
+    entry_price_usd: Mapped[Optional[float]] = mapped_column(Float)
+    entry_mcap: Mapped[Optional[float]] = mapped_column(Float)
+    entry_fdv: Mapped[Optional[float]] = mapped_column(Float)
+    entry_liq: Mapped[Optional[float]] = mapped_column(Float)
+    position_size_usd: Mapped[float] = mapped_column(Float, default=1000.0)
+    remaining_size_pct: Mapped[float] = mapped_column(
+        Float, default=100.0,
+        comment="% of original position still held (0-100)",
+    )
+
+    # Exit tracking
+    status: Mapped[str] = mapped_column(
+        String(20), default="open",
+        comment="'open' | 'tp1' | 'tp2' | 'tp3' | 'sl' | 'time_stop' | 'closed'",
+    )
+    realized_pnl_usd: Mapped[float] = mapped_column(Float, default=0.0)
+    unrealized_pnl_usd: Mapped[Optional[float]] = mapped_column(Float)
+
+    # Price tracking
+    highest_price_usd: Mapped[Optional[float]] = mapped_column(Float)
+    lowest_price_usd: Mapped[Optional[float]] = mapped_column(Float)
+    current_price_usd: Mapped[Optional[float]] = mapped_column(Float)
+    last_check_mcap: Mapped[Optional[float]] = mapped_column(Float)
+
+    # Timestamps
+    opened_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(),
+    )
+    closed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    last_checked_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+
+    # Relationship
+    token: Mapped["Token"] = relationship()
+
+    __table_args__ = (
+        Index("ix_paper_positions_status", "status"),
+        Index("ix_paper_positions_opened", "opened_at"),
+    )
+
+    def __repr__(self) -> str:
+        return f"<PaperPosition token_id={self.token_id} status={self.status} pnl={self.realized_pnl_usd:.2f}>"
+
+
+# ---------------------------------------------------------------------------
 # Engine / session helpers
 # ---------------------------------------------------------------------------
 

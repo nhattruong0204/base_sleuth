@@ -170,6 +170,20 @@ class FilteringConfig(BaseModel):
         description="If avg buy (vol/buys) < this $ with high buy count, flag as bot",
     )
 
+    # ── Wash-trading detection ──
+    wash_vol_liq_ratio: float = Field(
+        default=2.0,
+        description="If vol_1h/liquidity exceeds this AND buys > wash_min_buys, penalty applied",
+    )
+    wash_min_buys: int = Field(
+        default=200,
+        description="Minimum buys_1h to trigger wash-trading detection (with vol/liq ratio)",
+    )
+    wash_score_multiplier: float = Field(
+        default=0.50,
+        description="Multiply Stage 2 score by this when wash-trading detected (halved)",
+    )
+
     # ── Stage 3 — momentum detection ──
     min_volume_5m_usd: float = 100.0
     min_buys_1h: int = Field(
@@ -220,6 +234,16 @@ class FilteringConfig(BaseModel):
         le=1.0,
         description="Minimum weighted score to trigger an alert (lowered from 0.55 — "
                     "new weights + bot detection make scores more honest)",
+    )
+    champagne_score_threshold: float = Field(
+        default=0.30,
+        ge=0.0,
+        le=1.0,
+        description="Lower threshold for champagne tokens (only 3/390 were alerted — fix)",
+    )
+    skip_firehose_scoring: bool = Field(
+        default=True,
+        description="Skip full scoring for firehose tokens (0%% gem rate — ingestion only)",
     )
     min_alert_mcap_usd: float = Field(
         default=50_000.0,
@@ -408,8 +432,8 @@ class PIDConfig(BaseModel):
         description="Target proportion of alerts that should be gems",
     )
     threshold_adjust_step: float = Field(
-        default=0.01,
-        description="How much to adjust score_threshold per PID cycle",
+        default=0.005,
+        description="How much to adjust score_threshold per PID cycle (halved from 0.01)",
     )
     threshold_min: float = Field(
         default=0.40,
@@ -424,8 +448,8 @@ class PIDConfig(BaseModel):
         description="Rolling window for PID outcome ratio calculation",
     )
     min_samples: int = Field(
-        default=10,
-        description="Don't auto-tune until at least this many outcomes are classified",
+        default=50,
+        description="Don't auto-tune until at least 50 outcomes are classified (was 10 — too reactive)",
     )
     no_alert_decay_hours: int = Field(
         default=6,
@@ -651,6 +675,108 @@ class WalletMonitorConfig(BaseModel):
     )
 
 
+class ChampagneEvalConfig(BaseModel):
+    """Champagne token re-evaluation — catch gems that lacked DEX data initially.
+
+    Only 3/390 champagne tokens were alerted. Most had no DEX data when
+    first scored. This loop re-evaluates champagne tokens at intervals
+    up to max_age_hours after discovery with a lower threshold.
+    """
+
+    enabled: bool = Field(
+        default=True,
+        description="Enable champagne re-evaluation loop",
+    )
+    reeval_interval_seconds: int = Field(
+        default=600,
+        ge=60,
+        description="How often to re-check champagne tokens (10 min default)",
+    )
+    max_age_hours: int = Field(
+        default=3,
+        ge=1,
+        description="Stop re-evaluating champagne tokens older than this",
+    )
+
+
+class PaperTradingConfig(BaseModel):
+    """Simulated paper trading — auto-enter positions on alerts.
+
+    Tracks simulated positions with SL/TP rules to measure actual
+    bot profitability without risking real capital.
+    """
+
+    enabled: bool = Field(
+        default=True,
+        description="Enable auto paper trading on every alert",
+    )
+    position_size_usd: float = Field(
+        default=1000.0,
+        description="Simulated investment per alert (USD)",
+    )
+    stop_loss_pct: float = Field(
+        default=-30.0,
+        description="Stop loss trigger % (negative number, e.g. -30)",
+    )
+    tp1_pct: float = Field(
+        default=50.0,
+        description="Take profit 1 trigger % — sell 33% of position",
+    )
+    tp2_pct: float = Field(
+        default=100.0,
+        description="Take profit 2 trigger % — sell 33% of position",
+    )
+    tp3_pct: float = Field(
+        default=300.0,
+        description="Take profit 3 trigger % — sell remaining",
+    )
+    time_stop_hours: int = Field(
+        default=24,
+        description="Close position if flat (no TP hit) after N hours",
+    )
+    check_interval_seconds: int = Field(
+        default=300,
+        ge=60,
+        description="How often to check open positions (5 min default)",
+    )
+    max_open_positions: int = Field(
+        default=20,
+        ge=1,
+        description="Maximum simultaneous open paper positions",
+    )
+
+
+class MultiWalletConvictionConfig(BaseModel):
+    """Multi-wallet conviction detection.
+
+    When 2+ tracked wallets buy the same token within a time window,
+    fire a high-priority conviction alert. This is the strongest signal.
+    """
+
+    enabled: bool = Field(
+        default=True,
+        description="Enable multi-wallet conviction detection",
+    )
+    min_wallets: int = Field(
+        default=2,
+        ge=2,
+        description="Minimum distinct wallets buying same token to trigger",
+    )
+    window_hours: int = Field(
+        default=6,
+        ge=1,
+        description="Time window to look for multiple wallet buys",
+    )
+    auto_ingest_from_wallet_buy: bool = Field(
+        default=True,
+        description="When wallet buys a token not in DB, auto-ingest via DexScreener",
+    )
+    auto_ingest_min_liq: float = Field(
+        default=10_000.0,
+        description="Minimum liquidity for auto-ingested tokens from wallet buys",
+    )
+
+
 class ScrapingConfig(BaseModel):
     """Settings for the context resolver scraper."""
     clanker_page_url: str = "https://www.clanker.world/clanker/{address}"
@@ -677,6 +803,9 @@ class AppConfig(BaseModel):
     arkham: ArkhamConfig = Field(default_factory=ArkhamConfig)
     wallet_monitor: WalletMonitorConfig = Field(default_factory=WalletMonitorConfig)
     nansen: NansenConfig = Field(default_factory=NansenConfig)
+    champagne_eval: ChampagneEvalConfig = Field(default_factory=ChampagneEvalConfig)
+    paper_trading: PaperTradingConfig = Field(default_factory=PaperTradingConfig)
+    multi_conviction: MultiWalletConvictionConfig = Field(default_factory=MultiWalletConvictionConfig)
     telegram: TelegramConfig = Field(default_factory=TelegramConfig)
     scraping: ScrapingConfig = Field(default_factory=ScrapingConfig)
     log_level: str = "INFO"

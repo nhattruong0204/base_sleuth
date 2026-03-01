@@ -6,10 +6,10 @@ This document tracks the evolution of the gem-hunting strategy based on paper tr
 
 ---
 
-## Current Strategy Version: 1.4
+## Current Strategy Version: 1.5
 
-**Last Updated**: 2026-02-10
-**Based on**: Live Clanker API data analysis (431K+ tokens, 38K/day) + Arkham Intel smart wallet integration
+**Last Updated**: 2026-02-15
+**Based on**: Production DB analysis of 289,775 tokens + 283 alerts + 18 gems
 
 ### Active Scanning Strategy
 
@@ -249,6 +249,81 @@ Previously Telegram was one-way alerts only.
 - `bot_commands.py` (/wallets command)
 - `alembic/versions/004_add_smart_wallets_and_swaps.py`
 - `base-sleuth/SKILL.md`, `strategy_evolution.md`
+
+---
+
+### Iteration #5 — 2026-02-15 — Data-Driven Overhaul (v0.7.0)
+
+**Trigger**: Comprehensive analysis of all 289,775 tokens in production DB revealed
+systemic issues: 83% false positive rate, firehose 0% gem rate, PID runaway to 0.75
+ceiling, champagne only 3/390 alerted, 0 convictions fired.
+
+#### What Changed — 6 Fixes
+
+1. **Kill Firehose Scoring** (Fix 1):
+   - Firehose scored 259,073 tokens with 0 gems — pure CPU waste
+   - `skip_firehose_scoring: true` — firehose only ingests, never evaluates
+   - Eval pipeline now filters `discovery_source != 'firehose'`
+   - Profile/champagne/breakout/community_takeover tokens still scored normally
+
+2. **Fix Champagne Pipeline** (Fix 2):
+   - New `champagne_score_threshold: 0.30` (vs 0.45 normal)
+   - New `_champagne_eval_loop()` — re-evaluates champagne tokens up to 3h
+   - Problem: champagne tokens often have no DEX data at discovery time
+   - Loop re-checks every 10 min with lower threshold — never misses a real one
+
+3. **Multi-Wallet Conviction Engine** (Fix 3):
+   - New `_multi_conviction_loop()` — finds tokens bought by 2+ wallets in 6h window
+   - Reversed logic: wallet buy → check DexScreener (vs old: token → check wallets)
+   - Auto-ingests new tokens from wallet buys if liquidity ≥ $10K
+   - Fires high-conviction alerts with wallet count + details
+
+4. **Fix PID Controller** (Fix 4):
+   - `min_samples: 50` (was 10) — prevents overreaction to small dataset
+   - `threshold_adjust_step: 0.005` (was 0.01) — smaller corrections
+   - `threshold_max: 0.60` (hard ceiling, was 0.75)
+   - Asymmetric: lowering easier (step×1.5) than raising (step×1.0)
+   - All adjustments logged at INFO level for visibility
+
+5. **Paper Trading Simulator** (Fix 5):
+   - New `PaperPosition` model + Alembic migration 005
+   - Auto-enters $1000 simulated position on every alert
+   - Tracks SL (-30%), TP1 (+50%), TP2 (+100%), TP3 (+300%), time stop (24h)
+   - `_paper_trading_loop()` checks positions every 5 min via DexScreener
+   - New `/positions` Telegram command — portfolio dashboard with PnL, win rate
+   - First data-driven measurement of actual bot profitability
+
+6. **Wash-Trading Penalty** (Bonus):
+   - Detects tokens with vol_1h > 2× liquidity AND 200+ buys
+   - Applies 0.50× score multiplier — halves the score
+   - Catches artificial volume inflation patterns
+
+#### Architecture Changes
+- **12 async loops** (was 9): Added champagne_eval, paper_trading, multi_conviction
+- **New model**: PaperPosition (paper_positions table)
+- **New config classes**: ChampagneEvalConfig, PaperTradingConfig, MultiWalletConvictionConfig
+- **New bot command**: /positions — paper trading dashboard
+- **Updated startup ping**: Shows all 12 loops
+
+#### Data-Driven Rationale
+| Metric | Before | Expected After |
+|--------|--------|----------------|
+| Firehose tokens scored | 259,073 | 0 |
+| Champagne alert rate | 3/390 (0.8%) | ~50%+ with re-eval |
+| PID threshold | 0.75 (stuck at ceiling) | 0.45-0.55 range |
+| Conviction alerts fired | 0 | Multi-wallet triggers |
+| Bot profitability measured | ❌ Never | ✅ Paper trading |
+| Wash-trade false positives | Unknown | Filtered by 0.50× penalty |
+
+#### Files Modified
+- `config.py` — 3 new config classes + FilteringConfig (wash/firehose/champagne fields) + PID fixes
+- `filters.py` — Wash-trading penalty in Stage 2
+- `models.py` — PaperPosition model
+- `main.py` — 3 new loops, eval loop changes, PID rewrite, startup ping
+- `bot_commands.py` — /positions command + dashboard builder
+- `config.example.yaml` — All new config sections documented
+- `alembic/versions/005_add_paper_positions.py` — New table migration
+- `strategy_evolution.md` — This entry
 
 ---
 

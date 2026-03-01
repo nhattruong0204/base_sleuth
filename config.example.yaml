@@ -92,6 +92,22 @@ filtering:
   duplicate_symbol_cooldown_seconds: 7200  # Don't alert same symbol within 2h
   recheck_delay_seconds: 300           # Wait before DEX lookup (index time)
 
+  # ── Firehose scoring skip ────────────────────────────
+  # Firehose has 0% historical gem rate. Skip scoring entirely
+  # and only use it for token ingestion into the database.
+  skip_firehose_scoring: true          # Skip firehose tokens in eval pipeline
+
+  # ── Champagne-specific threshold ─────────────────────
+  # Lower alert threshold for champagne tokens (curated, 58% liq rate)
+  champagne_score_threshold: 0.30      # vs 0.45 for normal tokens
+
+  # ── Wash-trading penalty ─────────────────────────────
+  # Penalize tokens with suspicious volume patterns
+  # (high volume / low liquidity + many tiny buys)
+  wash_vol_liq_ratio: 2.0             # vol_1h / liquidity ratio trigger
+  wash_min_buys: 200                   # Min buys to flag wash trading
+  wash_score_multiplier: 0.50          # Multiply score by this when flagged
+
 # ── Breakout Scanner — delayed mover detection ───────────
 # Finds tokens that launched days ago but are NOW gaining momentum.
 # Uses DexScreener trending/boosted/profiles endpoints to detect tokens
@@ -159,11 +175,11 @@ pid:
   # Auto-tune (PID controller)
   auto_tune_enabled: true
   target_gem_rate: 0.25                # Target: 25% of alerts should be gems
-  threshold_adjust_step: 0.01          # Adjust by 0.01 per cycle
+  threshold_adjust_step: 0.005         # Adjust by 0.005 per cycle (was 0.01; prevents runaway)
   threshold_min: 0.40                  # Never go below this threshold
-  threshold_max: 0.60                  # Never go above this (must be < firehose_penalty)
+  threshold_max: 0.60                  # Never go above this (hard ceiling, was 0.75)
   lookback_hours: 48                   # Rolling window for outcome ratio
-  min_samples: 10                      # Need 10+ classified outcomes before tuning
+  min_samples: 50                      # Need 50+ classified outcomes before tuning (was 10)
   no_alert_decay_hours: 6              # Dead-man's switch: auto-lower threshold if no alerts for 6h
 
 # ── Arkham Intel — Smart Wallet Tracking ──────────────────
@@ -237,6 +253,41 @@ nansen:
   forward_alerts: false                        # Forward parsed signals as alerts
   auto_add_wallets: true                       # Auto-add wallets to watchlist + DB
   base_only: true                              # Only process Base chain signals
+
+# ── Champagne Evaluation Loop ───────────────────────────
+# Re-evaluates champagne tokens that initially had no DEX data
+# or scored below threshold. Champagne tokens (0.02% of all launches)
+# have a 58% real-liquidity rate — worth retrying.
+champagne_eval:
+  enabled: true
+  reeval_interval_seconds: 600         # Re-check every 10 minutes
+  max_age_hours: 3                     # Stop retrying after 3 hours
+
+# ── Paper Trading Simulator ─────────────────────────────
+# Auto-enters simulated positions on every alert to measure
+# real bot profitability without risking capital.
+# Tracks SL/TP exits and generates nightly P&L reports.
+paper_trading:
+  enabled: true
+  position_size_usd: 1000             # Simulated entry size per trade
+  stop_loss_pct: -30                   # Exit at -30% loss
+  tp1_pct: 50                          # Take 33% profit at +50%
+  tp2_pct: 100                         # Take 33% profit at +100%
+  tp3_pct: 300                         # Close remaining at +300%
+  time_stop_hours: 24                  # Auto-close after 24 hours
+  check_interval_seconds: 300          # Check positions every 5 minutes
+  max_open_positions: 20               # Max concurrent open positions
+
+# ── Multi-Wallet Conviction Engine ──────────────────────
+# When 2+ tracked wallets buy the same token within a time window,
+# fires a high-conviction alert. Also auto-ingests new tokens
+# discovered via wallet buys if they have sufficient liquidity.
+multi_conviction:
+  enabled: true
+  min_wallets: 2                       # Minimum distinct wallets to trigger
+  window_hours: 6                      # Time window for overlap detection
+  auto_ingest_from_wallet_buy: true    # Auto-add tokens from wallet buys
+  auto_ingest_min_liq: 10000           # Min liquidity to auto-ingest ($)
 
 telegram:
   bot_token: null          # or set TELEGRAM_BOT_TOKEN env var

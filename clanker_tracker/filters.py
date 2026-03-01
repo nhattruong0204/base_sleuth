@@ -241,6 +241,20 @@ class TokenFilter:
                 reason="; ".join(reasons),
             )
 
+        # ── Wash-trading detection ──
+        # Tokens with vol_1h > 2x liquidity AND 200+ buys are likely
+        # wash-traded. 73% of dead alerts showed this pattern.
+        is_wash_trading = False
+        if (
+            liq > 0
+            and buys >= self.cfg.wash_min_buys
+            and vol_1h / liq > self.cfg.wash_vol_liq_ratio
+        ):
+            is_wash_trading = True
+            reasons.append(
+                f"WASH vol/liq {vol_1h / liq:.1f}x + {buys} buys"
+            )
+
         # ── Liquidity (primary signal) ──
         if liq >= self.cfg.min_pool_liquidity_usd:
             # Scale: $1K=0.15, $5K=0.20, $10K+=0.30
@@ -288,6 +302,11 @@ class TokenFilter:
         if buys > 5 and avg_buy >= 200:
             score = min(score + 0.05, 1.0)
             reasons.append(f"avg buy ${avg_buy:.0f}")
+
+        # ── Wash-trading penalty ──
+        # Apply after all scoring if wash trading detected
+        if is_wash_trading:
+            score *= self.cfg.wash_score_multiplier
 
         return StageResult(
             passed=True,

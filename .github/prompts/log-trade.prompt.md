@@ -1,12 +1,12 @@
 ---
-description: "Log a paper trade in the trading journal and track performance"
+description: "Log a paper trade in the trading journal"
 mode: agent
 tools: ["changes", "codebase", "fetch"]
 ---
 
 # Task: Log a Paper Trade
 
-You are the Base Sleuth agent logging a paper trade.
+You are the Base Sleuth agent logging a paper trade with live market data.
 
 ## Context — Read First
 
@@ -14,29 +14,37 @@ You are the Base Sleuth agent logging a paper trade.
 - [strategy_evolution.md](../base-sleuth/references/strategy_evolution.md) — Current strategy version
 - [SKILL.md](../base-sleuth/SKILL.md) — Entry/exit criteria and position sizing rules
 
-## Rules
+## Position Sizing Rules
 
-1. Follow the trade template in `trading_journal.md` exactly
-2. Calculate position size based on SKILL.md rules (max 5%, scale by conviction)
-3. Set stop loss at -30%, TP1 at +50%, TP2 at +100%, TP3 at +300%
-4. Update the Performance Summary table at the top of the journal
-5. If this is trade #10, #20, etc. → also update `strategy_evolution.md` with a new iteration
+| Score | Size | Rationale |
+|-------|------|-----------|
+| 0.75+ | 5% ($500) | Strong gem — all signals aligned |
+| 0.60–0.74 | 3-4% ($300-400) | Good signal |
+| 0.45–0.59 | 2% ($200) | Speculative watchlist entry |
+| Below 0.45 | SKIP | Not enough conviction |
 
 ## For Entry Trades
 
-Fetch live data:
-- DexScreener: `https://api.dexscreener.com/latest/dex/tokens/{contract_address}`
-- Clanker: `https://www.clanker.world/api/tokens?address={contract_address}`
-
-Fill in ALL fields: liquidity, mcap, volume, buys/sells, price change, social links, description.
-Calculate a pipeline score based on the 5-stage criteria in SKILL.md.
+1. Fetch live data from DexScreener:
+   ```
+   GET https://api.dexscreener.com/latest/dex/tokens/{contract_address}
+   ```
+2. Record ALL fields: liquidity, mcap, fdv, volume, buys/sells, price changes, social links
+3. Calculate pipeline score per SKILL.md 5-stage criteria
+4. Set stops: SL at -30%, TP1 at +50%, TP2 at +100%, TP3 at +300%
+5. Update the Performance Summary table at the top of the journal
 
 ## For Exit Trades
 
-- Calculate P&L percentage and dollar amount
-- Update Current Balance in Performance Summary
-- Fill the OUTCOME section with what happened and learnings
-- Note which stages correctly predicted the outcome
+1. Fetch current price from DexScreener
+2. Calculate P&L percentage and dollar amount
+3. Update Current Balance in Performance Summary
+4. Fill OUTCOME section: what happened, which stages predicted correctly
+5. Note learnings for strategy evolution
+
+## Milestone Reviews
+
+Every 10th trade → also update `.github/base-sleuth/references/strategy_evolution.md` with a new iteration.
 
 ## Trade Details
 

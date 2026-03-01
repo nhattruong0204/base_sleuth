@@ -107,7 +107,7 @@ Breakout discovery endpoints (60 req/min each):
 
 ## Scanning Architecture
 
-The codebase runs **eight concurrent async loops**:
+The codebase runs **twelve concurrent async loops**:
 
 ### Loop 1 — Firehose (every 30s)
 ```
@@ -172,6 +172,45 @@ For each new buy above $100 USD:
   3. Checks if token exists in our DB → conviction signal
   4. Sends high-priority conviction alert if match found
 Heavy endpoint: 1 req/sec rate limit observed.
+```
+
+### Loop 8 — Wallet Watch (every 120s)
+```
+On-chain monitoring via BaseScan API for ERC-20 transfers.
+Polls tracked wallets for buy activity on DEX routers.
+Uses data/smart_money_wallets.txt + Nansen-discovered wallets.
+```
+
+### Loop 9 — Nansen Telethon Listener (persistent)
+```
+Telethon-based listener for @NansenBot Telegram signals.
+Parses wallet buy/sell messages and auto-adds to tracking.
+Runs as persistent connection (not polling interval).
+```
+
+### Loop 10 — Champagne Eval (every 10m)
+```
+Re-evaluates champagne tokens that had no DEX data at discovery.
+Uses lower threshold (0.30 vs 0.45) — champagne tokens are pre-vetted.
+Retries up to max_age_hours (3h) before giving up.
+Catches champagne gems that DEX data took time to populate.
+```
+
+### Loop 11 — Paper Trading (every 5m)
+```
+Monitors open paper positions for SL/TP/time_stop triggers.
+Batch-fetches prices from DexScreener for all open positions.
+Exit rules: SL -30%, TP1 +50% (sell 33%), TP2 +100% (sell 33%),
+  TP3 +300% (close remaining), time stop 24h.
+Tracks realized PnL, win rate, peak/trough prices.
+```
+
+### Loop 12 — Multi-Wallet Conviction (every 5m)
+```
+Detects tokens bought by 2+ distinct tracked wallets within 6h.
+Fires high-conviction alerts with wallet count + details.
+Auto-ingests tokens not in DB if DexScreener shows liq ≥ $10K.
+Reverse logic: starts from wallet buys, not token discovery.
 ```
 
 ### Deployment — 24/7 Docker Stack

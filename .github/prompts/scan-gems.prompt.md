@@ -1,5 +1,5 @@
 ---
-description: "Scan for gems right now — fetch live Clanker + DexScreener data"
+description: "Scan for hidden gems right now — live Clanker + DexScreener data"
 mode: agent
 tools: ["codebase", "fetch"]
 ---
@@ -17,54 +17,51 @@ You are running a live gem scan on Base chain via Clanker API + DexScreener.
 
 ## Scan Steps
 
-### 1. Fetch Champagne Tokens (Highest Priority)
+### 1. Champagne Tokens (Highest Priority)
 ```
 GET https://www.clanker.world/api/tokens?champagne=true&sort=desc
 ```
-These are the 0.02% curated tokens — 58% have real liquidity.
+Only 0.02% of tokens — but 58% have real liquidity.
 
-### 2. Fetch Latest Non-Bankr Tokens
+### 2. Latest Non-Bankr Tokens
 ```
 GET https://www.clanker.world/api/tokens?sort=desc
 ```
-Filter out tokens where description contains "bankrbot".
+Skip tokens where description contains "bankrbot" or "bankr terminal".
 
-### 2.5. Scan DexScreener for Breakout Tokens (Delayed Movers)
+### 3. DexScreener Breakout Tokens
 ```
 GET https://api.dexscreener.com/token-boosts/top/v1
 GET https://api.dexscreener.com/token-boosts/latest/v1
 GET https://api.dexscreener.com/token-profiles/latest/v1
 ```
-Filter to chainId=base, fetch metrics, apply quality thresholds (liq≥$10K, vol≥$5K, momentum).
+Filter to `chainId=base`, then fetch full metrics. Apply: liq ≥ $10K, vol24h ≥ $5K, momentum required.
 
-### 3. Check DexScreener for Survivors
-For each candidate, fetch:
+### 4. Get DexScreener Metrics for Candidates
 ```
 GET https://api.dexscreener.com/latest/dex/tokens/{contract_address}
 ```
 Skip tokens with no pairs (dead on arrival).
 
-### 4. Score Each Candidate
+### 5. Score Each Candidate (5-Stage Pipeline)
 
-Apply the 5-stage pipeline from SKILL.md:
-- S1: Scam keywords, name check
-- S2: Liquidity ≥$500, volume, buy/sell ratio
-- S3: Momentum — buys/hr, price change %
-- S4: Any smart money wallets from watchlist?
-- S5: Social links, description quality
-- Champagne bonus: +15%
-- Breakout bonus: +10% (for DexScreener trending tokens)
+- S1: Scam keywords, name validation
+- S2: Liquidity ≥ $500, volume, buy/sell ratio, holder count
+- S3: Momentum — buys/hr ≥ 5, price surge, vol/liq ratio
+- S4: Smart money wallets from watchlist
+- S5: Social links, description, origin quality
+- Champagne bonus: +15% | Breakout bonus: +10%
 
-### 5. Report
+### 6. Report Results
 
-For each token scoring ≥ 0.45, report:
+For each token scoring ≥ 0.45:
 ```
-🚀 TOKEN_NAME ($SYMBOL) — Score: XX%
-🍾 Champagne: Yes/No  |  Platform: direct/bankr/clawnch
-💰 Liq: $XX,XXX  |  Vol 24h: $XX,XXX  |  MCap: $XX,XXX
-📈 Buys/hr: XX  |  Price 1h: +XX%  |  Price 24h: +XX%
-🔗 DexScreener: https://dexscreener.com/base/{addr}
-🔗 Clanker: https://www.clanker.world/clanker/{addr}
+🚀 TOKEN ($SYMBOL) — Score: XX%
+🍾 Champagne: Yes/No | Platform: direct/bankr/clawnch
+💰 MCap $XXK · FDV $XXK · Liq $XXK
+📊 Vol 24h: $XXK | Buys/hr: XX | Price 1h: +XX%
+🔗 DexScreener | Uniswap | Clanker Page
+CA: 0x...
 ```
 
 {{{ input }}}

@@ -30,7 +30,7 @@ from .clanker_client import ClankerClient, BreakoutScanner, GainersScanner
 from .config import AppConfig, load_config
 from .context_resolver import ContextResolver
 from .filters import TokenFilter
-from .models import AlertOutcome, SmartWallet, Token, TokenMetrics, WalletSwap, create_engine, create_session_factory, init_db
+from .models import AlertOutcome, PaperPosition, SmartWallet, Token, TokenMetrics, WalletSwap, create_engine, create_session_factory, init_db
 from .notifier import TelegramNotifier
 from .arkham_client import ArkhamClient, WalletTracker
 from .wallet_monitor import WalletMonitor
@@ -51,6 +51,7 @@ class Tracker:
         self._backoff: dict[str, int] = {
             "poll": 0, "champagne": 0, "breakout": 0, "gainers": 0, "eval": 0, "outcome": 0,
             "wallet_sync": 0, "wallet_monitor": 0, "wallet_watch": 0, "nansen": 0,
+            "champagne_eval": 0, "paper_trading": 0, "multi_conviction": 0,
         }
         self._MAX_BACKOFF = 300  # Cap backoff at 5 min
 
@@ -205,6 +206,14 @@ class Tracker:
             loops.append(self._wallet_watch_loop())
         if self._nansen_listener and self._nansen_listener._running:
             loops.append(self._nansen_telethon_loop())
+
+        # New v0.7 loops
+        if self.cfg.champagne_eval.enabled:
+            loops.append(self._champagne_eval_loop())
+        if self.cfg.paper_trading.enabled:
+            loops.append(self._paper_trading_loop())
+        if self.cfg.multi_conviction.enabled:
+            loops.append(self._multi_conviction_loop())
 
         loop_count = len(loops)
         logger.info("tracker.running", loops=loop_count, telegram_bot="active")
@@ -418,15 +427,16 @@ class Tracker:
         """Process tokens that have not been scored yet.
 
         Pipeline:
-        1. Fetch unscored tokens from DB
+        1. Fetch unscored tokens from DB (skip firehose if configured)
         2. Pre-filter: skip obvious trash (Bankr, no socials, etc.)
         3. Batch DexScreener lookup for survivors
         4. Full scoring pipeline for tokens with DEX data
-        5. Telegram alert for gems above threshold
+        5. Telegram alert for gems above threshold (champagne uses lower threshold)
         """
         # Small initial delay so poll loops can populate the DB
         await asyncio.sleep(5)
         recheck_delay = self.cfg.filtering.recheck_delay_seconds
+        skip_firehose = self.cfg.filtering.skip_firehose_scoring
 
         while not self._shutdown.is_set():
             try:
@@ -441,7 +451,15 @@ class Tracker:
                         select(Token)
                         .where(Token.quality_score.is_(None))
                         .where(Token.discovered_at <= cutoff)
-                        .order_by(
+                    )
+
+                    # Fix 1: Skip firehose scoring — firehose has 0% gem rate
+                    # Only score tokens from profile/boost/champagne/community_takeover/breakout
+                    if skip_firehose:
+                        stmt = stmt.where(Token.discovery_source != "firehose")
+
+                    stmt = (
+                        stmt.order_by(
                             # Champagne tokens first (priority queue)
                             Token.is_champagne.desc(),
                             Token.is_breakout.desc(),
@@ -505,6 +523,22 @@ class Tracker:
                             token, session,
                         )
                         self._stats["tokens_scored"] += 1
+
+                        # Fix 2: Champagne tokens use lower threshold
+                        # Override rejection if champagne and score >= champagne threshold
+                        if (
+                            filt_result.rejected
+                            and token.is_champagne
+                            and filt_result.final_score >= self.cfg.filtering.champagne_score_threshold
+                        ):
+                            filt_result.rejected = False
+                            filt_result.rejection_reason = ""
+                            logger.info(
+                                "champagne.threshold_override",
+                                token=token.symbol,
+                                score=filt_result.final_score,
+                                champagne_threshold=self.cfg.filtering.champagne_score_threshold,
+                            )
 
                         # Notify if above threshold
                         if not filt_result.rejected and not token.alert_sent:
@@ -611,6 +645,12 @@ class Tracker:
                                     ),
                                 )
                                 session.add(outcome)
+
+                                # Fix 5: Auto paper trading
+                                if self.cfg.paper_trading.enabled:
+                                    await self._open_paper_position(
+                                        session, token, metrics,
+                                    )
 
                     await session.commit()
 
@@ -817,21 +857,22 @@ class Tracker:
         return "survivor"
 
     async def _pid_auto_tune(self, session, pid_cfg) -> None:
-        """PID controller: adjust score_threshold based on outcome history.
+        """Fixed PID controller: conservative threshold adjustment.
 
-        Includes dead-man's switch: if no alerts have been sent within
-        ``no_alert_decay_hours``, the threshold auto-lowers by one step
-        per cycle to prevent runaway silencing.
+        Improvements over v1:
+        - min_samples raised to 50 (was 10 — too reactive)
+        - step halved to 0.005 (was 0.01 — too aggressive)
+        - Hard ceiling at threshold_max (0.60)
+        - Asymmetric: easier to lower than to raise
+        - Always log at INFO level (debug was invisible)
         """
         from datetime import datetime, timezone, timedelta
         from sqlalchemy import select, func
 
-        step = pid_cfg.threshold_adjust_step
+        step = pid_cfg.threshold_adjust_step  # Now 0.005
         current = self.cfg.filtering.score_threshold
 
         # ── Dead-man's switch ──
-        # If no alerts sent recently, the PID has likely run away.
-        # Decay the threshold toward min until alerts resume.
         decay_hours = getattr(pid_cfg, "no_alert_decay_hours", 6)
         decay_cutoff = datetime.now(timezone.utc) - timedelta(hours=decay_hours)
         recent_alerts_stmt = (
@@ -863,6 +904,12 @@ class Tracker:
         total = (await session.execute(total_stmt)).scalar() or 0
 
         if total < pid_cfg.min_samples:
+            logger.info(
+                "pid.insufficient_samples",
+                total=total,
+                required=pid_cfg.min_samples,
+                threshold=current,
+            )
             return  # Not enough data yet
 
         gem_stmt = (
@@ -882,46 +929,41 @@ class Tracker:
         gem_rate = gems / total
         dead_rate = deads / total
 
-        # PID-style adjustment:
-        # - Too many dead → raise threshold (proportional to dead_rate)
-        # - Gem rate above target → lower threshold
-        # - Moderate zone → small downward nudge to avoid stagnation
+        # Asymmetric PID:
+        # - Raising is harder (step * 1.0) — we don't want to silence the bot
+        # - Lowering is easier (step * 1.5) — we DO want to find more gems
+        # - Max single adjustment capped at step (never 2x step anymore)
         adjustment = 0.0
 
         if dead_rate > 0.60:
-            # Aggressive: lots of trash getting through
-            adjustment = step * 2
+            adjustment = step  # Was step * 2 — too aggressive
         elif dead_rate > 0.40:
-            adjustment = step
+            adjustment = step * 0.5
         elif gem_rate >= pid_cfg.target_gem_rate:
-            # Meeting target — lower threshold to find more gems
-            adjustment = -step
+            adjustment = -step * 1.5  # Asymmetric: lower more easily
         elif dead_rate < 0.30 and current > pid_cfg.threshold_min:
-            # Low dead rate but low gem rate too — cautiously lower
-            adjustment = -step * 0.5
+            adjustment = -step
 
         new_threshold = round(
             max(pid_cfg.threshold_min, min(pid_cfg.threshold_max, current + adjustment)),
             3,
         )
 
+        # Always log at INFO so we can see PID history
+        logger.info(
+            "pid.auto_tune",
+            old=current,
+            new=new_threshold,
+            adjustment=round(adjustment, 4),
+            gem_rate=round(gem_rate, 3),
+            dead_rate=round(dead_rate, 3),
+            total_outcomes=total,
+            gems=gems,
+            deads=deads,
+        )
+
         if new_threshold != current:
             self.cfg.filtering.score_threshold = new_threshold
-            logger.info(
-                "pid.threshold_adjusted",
-                old=current,
-                new=new_threshold,
-                gem_rate=round(gem_rate, 3),
-                dead_rate=round(dead_rate, 3),
-                total_outcomes=total,
-            )
-        else:
-            logger.debug(
-                "pid.no_change",
-                threshold=current,
-                gem_rate=round(gem_rate, 3),
-                dead_rate=round(dead_rate, 3),
-            )
 
     # ------------------------------------------------------------------
     # Wallet sync loop — periodic Arkham wallet refresh
@@ -1082,6 +1124,542 @@ class Tracker:
                 pass
 
     # ------------------------------------------------------------------
+    # Champagne re-evaluation loop — catch slow-starting champagne gems
+    # ------------------------------------------------------------------
+
+    async def _champagne_eval_loop(self) -> None:
+        """Re-evaluate champagne tokens that scored low or had no DEX data.
+
+        Only 3/390 champagne tokens were alerted. Most lacked DEX data at
+        first scoring. This loop re-checks them at intervals with the lower
+        champagne_score_threshold until max_age_hours is reached.
+        """
+        ce_cfg = self.cfg.champagne_eval
+        if not ce_cfg.enabled:
+            logger.info("champagne_eval.disabled")
+            return
+
+        interval = ce_cfg.reeval_interval_seconds
+        await asyncio.sleep(120)  # Let other loops warm up
+
+        while not self._shutdown.is_set():
+            try:
+                async with self._session_factory() as session:
+                    from datetime import datetime, timezone, timedelta
+                    from sqlalchemy import select, or_
+
+                    now = datetime.now(timezone.utc)
+                    max_age = timedelta(hours=ce_cfg.max_age_hours)
+                    cutoff = now - max_age
+
+                    # Find champagne tokens that:
+                    # - Were scored but below alert threshold
+                    # - Have not been alerted
+                    # - Are younger than max_age_hours
+                    stmt = (
+                        select(Token)
+                        .where(Token.is_champagne.is_(True))
+                        .where(Token.alert_sent.is_(False))
+                        .where(Token.discovered_at >= cutoff)
+                        .where(
+                            or_(
+                                Token.quality_score.is_(None),
+                                Token.quality_score < self.cfg.filtering.score_threshold,
+                            )
+                        )
+                        .order_by(Token.discovered_at.desc())
+                        .limit(10)
+                    )
+                    tokens = list((await session.execute(stmt)).scalars().all())
+
+                    if tokens:
+                        logger.info(
+                            "champagne_eval.batch",
+                            count=len(tokens),
+                            names=[t.symbol for t in tokens],
+                        )
+
+                        for token in tokens:
+                            if self._shutdown.is_set():
+                                break
+
+                            # Re-score — reset quality_score to force re-evaluation
+                            token.quality_score = None
+                            token.rejection_reason = None
+
+                            ctx = await self._resolver.resolve(token, session)
+                            filt_result = await self._filter.evaluate(token, session)
+                            self._stats["tokens_scored"] += 1
+
+                            # Use champagne-specific lower threshold
+                            threshold = self.cfg.filtering.champagne_score_threshold
+                            if (
+                                filt_result.final_score >= threshold
+                                and not token.alert_sent
+                            ):
+                                metrics = filt_result.metrics
+                                alert_mcap = (metrics.market_cap_usd or 0) if metrics else 0
+                                alert_liq = (metrics.liquidity_usd or 0) if metrics else 0
+
+                                # Still enforce hard gates
+                                if alert_mcap < self.cfg.filtering.min_alert_mcap_usd:
+                                    continue
+                                if alert_liq < self.cfg.filtering.min_alert_liquidity_usd:
+                                    continue
+
+                                nansen_buys = await self._query_nansen_buys(
+                                    session, token.contract_address,
+                                )
+                                sent = await self._notifier.notify(
+                                    token, ctx, filt_result,
+                                    nansen_buys=nansen_buys or None,
+                                )
+                                if sent:
+                                    token.alert_sent = True
+                                    self._stats["alerts_sent"] += 1
+                                    logger.info(
+                                        "champagne_eval.alert_sent",
+                                        token=token.symbol,
+                                        score=filt_result.final_score,
+                                        mcap=alert_mcap,
+                                    )
+                                    # Record outcome
+                                    outcome = AlertOutcome(
+                                        token_id=token.id,
+                                        alert_score=filt_result.final_score,
+                                        alert_mcap=alert_mcap,
+                                        alert_fdv=(metrics.fdv_usd if metrics else None),
+                                        alert_liq=alert_liq,
+                                        alert_vol_1h=(metrics.volume_1h_usd if metrics else None),
+                                        alert_buys_1h=(metrics.buys_1h if metrics else None),
+                                    )
+                                    session.add(outcome)
+
+                                    if self.cfg.paper_trading.enabled:
+                                        await self._open_paper_position(
+                                            session, token, metrics,
+                                        )
+
+                    await session.commit()
+
+                self._backoff["champagne_eval"] = 0
+            except Exception:
+                self._stats["errors"] += 1
+                self._backoff["champagne_eval"] = min(
+                    self._backoff.get("champagne_eval", 0) + 1, 10,
+                )
+                logger.exception("champagne_eval.error")
+
+            wait = interval + self._backoff_delay("champagne_eval")
+            try:
+                await asyncio.wait_for(self._shutdown.wait(), timeout=wait)
+                break
+            except asyncio.TimeoutError:
+                pass
+
+    # ------------------------------------------------------------------
+    # Paper trading loop — manage simulated positions
+    # ------------------------------------------------------------------
+
+    async def _open_paper_position(
+        self, session, token: Token, metrics,
+    ) -> None:
+        """Open a simulated paper position for a token alert."""
+        pt_cfg = self.cfg.paper_trading
+        if not pt_cfg.enabled:
+            return
+
+        # Check max open positions
+        from sqlalchemy import select, func
+        open_count = await session.scalar(
+            select(func.count(PaperPosition.id))
+            .where(PaperPosition.status == "open")
+        )
+        if (open_count or 0) >= pt_cfg.max_open_positions:
+            logger.info(
+                "paper.max_positions_reached",
+                open=open_count,
+                max=pt_cfg.max_open_positions,
+            )
+            return
+
+        # Check if we already have a position for this token
+        existing = await session.scalar(
+            select(func.count(PaperPosition.id))
+            .where(PaperPosition.token_id == token.id)
+        )
+        if existing:
+            return
+
+        entry_price = (metrics.price_usd or 0) if metrics else 0
+        entry_mcap = (metrics.market_cap_usd or 0) if metrics else 0
+        entry_fdv = (metrics.fdv_usd or 0) if metrics else 0
+        entry_liq = (metrics.liquidity_usd or 0) if metrics else 0
+
+        position = PaperPosition(
+            token_id=token.id,
+            entry_price_usd=entry_price,
+            entry_mcap=entry_mcap,
+            entry_fdv=entry_fdv,
+            entry_liq=entry_liq,
+            position_size_usd=pt_cfg.position_size_usd,
+            remaining_size_pct=100.0,
+            status="open",
+            highest_price_usd=entry_price,
+            lowest_price_usd=entry_price,
+            current_price_usd=entry_price,
+        )
+        session.add(position)
+        logger.info(
+            "paper.position_opened",
+            token=token.symbol,
+            entry_price=entry_price,
+            size=pt_cfg.position_size_usd,
+            mcap=entry_mcap,
+        )
+
+    async def _paper_trading_loop(self) -> None:
+        """Check open paper positions for SL/TP triggers.
+
+        For each open position:
+        1. Fetch live price from DexScreener
+        2. Check stop-loss (-30%)
+        3. Check take-profit levels (TP1 +50%, TP2 +100%, TP3 +300%)
+        4. Check time stop (24h flat)
+        5. Update PnL + highest/lowest
+        """
+        pt_cfg = self.cfg.paper_trading
+        if not pt_cfg.enabled:
+            logger.info("paper_trading.disabled")
+            return
+
+        interval = pt_cfg.check_interval_seconds
+        await asyncio.sleep(60)
+
+        while not self._shutdown.is_set():
+            try:
+                async with self._session_factory() as session:
+                    from datetime import datetime, timezone, timedelta
+                    from sqlalchemy import select
+
+                    now = datetime.now(timezone.utc)
+
+                    # Get all open positions
+                    stmt = (
+                        select(PaperPosition)
+                        .where(PaperPosition.status.in_(["open", "tp1", "tp2"]))
+                        .order_by(PaperPosition.opened_at.asc())
+                    )
+                    positions = list((await session.execute(stmt)).scalars().all())
+
+                    if not positions:
+                        try:
+                            await asyncio.wait_for(
+                                self._shutdown.wait(), timeout=interval,
+                            )
+                            break
+                        except asyncio.TimeoutError:
+                            continue
+
+                    # Get token addresses for batch DexScreener
+                    token_ids = [p.token_id for p in positions]
+                    token_stmt = select(Token).where(Token.id.in_(token_ids))
+                    tokens = {
+                        t.id: t
+                        for t in (await session.execute(token_stmt)).scalars().all()
+                    }
+
+                    token_list = [t for t in tokens.values() if t.contract_address]
+                    dex_map = await self._filter.fetch_dex_metrics_batch(token_list)
+
+                    closed_count = 0
+                    for pos in positions:
+                        token = tokens.get(pos.token_id)
+                        if not token:
+                            continue
+                        addr = token.contract_address.lower()
+                        m = dex_map.get(addr)
+
+                        if not m or not m.price_usd:
+                            # No DEX data — might be dead
+                            age_hours = (now - pos.opened_at).total_seconds() / 3600
+                            if age_hours >= pt_cfg.time_stop_hours:
+                                pos.status = "sl"
+                                pos.closed_at = now
+                                pos.realized_pnl_usd -= pos.position_size_usd * (pos.remaining_size_pct / 100)
+                                pos.remaining_size_pct = 0
+                                closed_count += 1
+                            continue
+
+                        current_price = m.price_usd
+                        entry_price = pos.entry_price_usd or 0
+
+                        if entry_price <= 0:
+                            continue
+
+                        pos.current_price_usd = current_price
+                        pos.last_check_mcap = m.market_cap_usd
+                        pos.last_checked_at = now
+
+                        # Track high/low
+                        if pos.highest_price_usd is None or current_price > pos.highest_price_usd:
+                            pos.highest_price_usd = current_price
+                        if pos.lowest_price_usd is None or current_price < pos.lowest_price_usd:
+                            pos.lowest_price_usd = current_price
+
+                        pnl_pct = ((current_price - entry_price) / entry_price) * 100
+                        pos.unrealized_pnl_usd = pos.position_size_usd * (pos.remaining_size_pct / 100) * (pnl_pct / 100)
+
+                        # ── Stop loss ──
+                        if pnl_pct <= pt_cfg.stop_loss_pct:
+                            loss_usd = pos.position_size_usd * (pos.remaining_size_pct / 100) * (pnl_pct / 100)
+                            pos.realized_pnl_usd += loss_usd
+                            pos.remaining_size_pct = 0
+                            pos.status = "sl"
+                            pos.closed_at = now
+                            closed_count += 1
+                            logger.info(
+                                "paper.stop_loss",
+                                token=token.symbol,
+                                pnl_pct=round(pnl_pct, 1),
+                                realized=round(pos.realized_pnl_usd, 2),
+                            )
+                            continue
+
+                        # ── Take profit levels ──
+                        sell_pct_per_tp = 33.33
+
+                        if pos.status == "open" and pnl_pct >= pt_cfg.tp1_pct:
+                            sell_size = pos.position_size_usd * (sell_pct_per_tp / 100)
+                            profit = sell_size * (pnl_pct / 100)
+                            pos.realized_pnl_usd += profit
+                            pos.remaining_size_pct -= sell_pct_per_tp
+                            pos.status = "tp1"
+                            logger.info(
+                                "paper.tp1_hit",
+                                token=token.symbol,
+                                pnl_pct=round(pnl_pct, 1),
+                                realized=round(pos.realized_pnl_usd, 2),
+                            )
+
+                        if pos.status == "tp1" and pnl_pct >= pt_cfg.tp2_pct:
+                            sell_size = pos.position_size_usd * (sell_pct_per_tp / 100)
+                            profit = sell_size * (pnl_pct / 100)
+                            pos.realized_pnl_usd += profit
+                            pos.remaining_size_pct -= sell_pct_per_tp
+                            pos.status = "tp2"
+                            logger.info(
+                                "paper.tp2_hit",
+                                token=token.symbol,
+                                pnl_pct=round(pnl_pct, 1),
+                                realized=round(pos.realized_pnl_usd, 2),
+                            )
+
+                        if pos.status == "tp2" and pnl_pct >= pt_cfg.tp3_pct:
+                            sell_size = pos.position_size_usd * (pos.remaining_size_pct / 100)
+                            profit = sell_size * (pnl_pct / 100)
+                            pos.realized_pnl_usd += profit
+                            pos.remaining_size_pct = 0
+                            pos.status = "tp3"
+                            pos.closed_at = now
+                            closed_count += 1
+                            logger.info(
+                                "paper.tp3_hit",
+                                token=token.symbol,
+                                pnl_pct=round(pnl_pct, 1),
+                                realized=round(pos.realized_pnl_usd, 2),
+                            )
+
+                        # ── Time stop ──
+                        age_hours = (now - pos.opened_at).total_seconds() / 3600
+                        if age_hours >= pt_cfg.time_stop_hours and pos.remaining_size_pct > 0:
+                            remaining_value = pos.position_size_usd * (pos.remaining_size_pct / 100)
+                            final_pnl = remaining_value * (pnl_pct / 100)
+                            pos.realized_pnl_usd += final_pnl
+                            pos.remaining_size_pct = 0
+                            pos.status = "time_stop"
+                            pos.closed_at = now
+                            closed_count += 1
+                            logger.info(
+                                "paper.time_stop",
+                                token=token.symbol,
+                                pnl_pct=round(pnl_pct, 1),
+                                age_hours=round(age_hours, 1),
+                                realized=round(pos.realized_pnl_usd, 2),
+                            )
+
+                    if closed_count > 0:
+                        logger.info("paper.positions_closed", count=closed_count)
+
+                    await session.commit()
+
+                self._backoff["paper_trading"] = 0
+            except Exception:
+                self._stats["errors"] += 1
+                self._backoff["paper_trading"] = min(
+                    self._backoff.get("paper_trading", 0) + 1, 10,
+                )
+                logger.exception("paper_trading.error")
+
+            wait = interval + self._backoff_delay("paper_trading")
+            try:
+                await asyncio.wait_for(self._shutdown.wait(), timeout=wait)
+                break
+            except asyncio.TimeoutError:
+                pass
+
+    # ------------------------------------------------------------------
+    # Multi-wallet conviction detection — cross-scanner overlap
+    # ------------------------------------------------------------------
+
+    async def _multi_conviction_loop(self) -> None:
+        """Detect multiple tracked wallets buying the same token.
+
+        When 2+ wallets buy the same token within a time window, fire
+        a high-priority conviction alert. This is the strongest signal.
+
+        Also: reverse-lookup — when a wallet buys a token not in DB,
+        auto-ingest it if it meets min_liq requirements.
+        """
+        mc_cfg = self.cfg.multi_conviction
+        if not mc_cfg.enabled:
+            logger.info("multi_conviction.disabled")
+            return
+
+        interval = 120  # Check every 2 minutes
+        await asyncio.sleep(60)
+
+        while not self._shutdown.is_set():
+            try:
+                async with self._session_factory() as session:
+                    from datetime import datetime, timezone, timedelta
+                    from sqlalchemy import select, func
+
+                    now = datetime.now(timezone.utc)
+                    window = timedelta(hours=mc_cfg.window_hours)
+                    cutoff = now - window
+
+                    # Find tokens bought by 2+ distinct wallets within window
+                    stmt = (
+                        select(
+                            WalletSwap.token_address,
+                            func.count(func.distinct(WalletSwap.wallet_address)).label("wallet_count"),
+                        )
+                        .where(WalletSwap.action == "buy")
+                        .where(WalletSwap.recorded_at >= cutoff)
+                        .where(WalletSwap.conviction_sent.is_(False))
+                        .group_by(WalletSwap.token_address)
+                        .having(
+                            func.count(func.distinct(WalletSwap.wallet_address)) >= mc_cfg.min_wallets
+                        )
+                    )
+                    rows = (await session.execute(stmt)).all()
+
+                    for token_addr, wallet_count in rows:
+                        # Check if token is in our DB
+                        token = (
+                            await session.execute(
+                                select(Token)
+                                .where(Token.contract_address == token_addr)
+                                .limit(1)
+                            )
+                        ).scalar_one_or_none()
+
+                        if token:
+                            # Fire multi-wallet conviction
+                            swaps_stmt = (
+                                select(WalletSwap)
+                                .where(WalletSwap.token_address == token_addr)
+                                .where(WalletSwap.action == "buy")
+                                .where(WalletSwap.recorded_at >= cutoff)
+                            )
+                            swaps = list((await session.execute(swaps_stmt)).scalars().all())
+
+                            wallet = None
+                            if swaps:
+                                w_stmt = (
+                                    select(SmartWallet)
+                                    .where(SmartWallet.address == swaps[0].wallet_address)
+                                    .limit(1)
+                                )
+                                wallet = (await session.execute(w_stmt)).scalar_one_or_none()
+
+                            conviction = {
+                                "token": token,
+                                "wallet": wallet,
+                                "buy": {
+                                    "wallet_address": swaps[0].wallet_address if swaps else "",
+                                    "usd_value": sum(s.usd_value or 0 for s in swaps),
+                                    "tx_hash": swaps[0].tx_hash if swaps else "",
+                                    "wallet_alias": f"{wallet_count} wallets",
+                                },
+                                "is_alerted": token.alert_sent,
+                            }
+                            await self._notifier.notify_conviction(conviction)
+                            logger.info(
+                                "multi_conviction.fired",
+                                token=token.symbol,
+                                wallets=wallet_count,
+                                total_usd=sum(s.usd_value or 0 for s in swaps),
+                            )
+
+                            # Mark swaps as conviction-sent
+                            for swap in swaps:
+                                swap.conviction_sent = True
+                        elif mc_cfg.auto_ingest_from_wallet_buy:
+                            # Token not in DB — auto-ingest via DexScreener
+                            dex_url = self.cfg.dexscreener.base_url
+                            try:
+                                resp = await self._http.get(
+                                    f"{dex_url}/tokens/{token_addr}", timeout=10,
+                                )
+                                resp.raise_for_status()
+                                pairs = resp.json().get("pairs") or []
+                                if pairs:
+                                    pair = pairs[0]
+                                    liq = float((pair.get("liquidity") or {}).get("usd", 0))
+                                    if liq >= mc_cfg.auto_ingest_min_liq:
+                                        new_token = Token(
+                                            contract_address=token_addr,
+                                            name=pair.get("baseToken", {}).get("name", ""),
+                                            symbol=pair.get("baseToken", {}).get("symbol", ""),
+                                            chain="base",
+                                            discovery_source="wallet_conviction",
+                                            is_breakout=True,
+                                        )
+                                        session.add(new_token)
+                                        logger.info(
+                                            "multi_conviction.auto_ingest",
+                                            token=new_token.symbol,
+                                            address=token_addr[:12],
+                                            liq=liq,
+                                            wallets=wallet_count,
+                                        )
+                            except Exception as exc:
+                                logger.warning(
+                                    "multi_conviction.ingest_failed",
+                                    addr=token_addr[:12],
+                                    error=str(exc),
+                                )
+
+                    await session.commit()
+
+                self._backoff["multi_conviction"] = 0
+            except Exception:
+                self._stats["errors"] += 1
+                self._backoff["multi_conviction"] = min(
+                    self._backoff.get("multi_conviction", 0) + 1, 10,
+                )
+                logger.exception("multi_conviction.error")
+
+            wait = interval + self._backoff_delay("multi_conviction")
+            try:
+                await asyncio.wait_for(self._shutdown.wait(), timeout=wait)
+                break
+            except asyncio.TimeoutError:
+                pass
+
+    # ------------------------------------------------------------------
     # Nansen Telethon loop — runs Telethon event loop alongside others
     # ------------------------------------------------------------------
 
@@ -1221,6 +1799,17 @@ class Tracker:
                 if self._nansen_listener and self._nansen_listener._running:
                     nansen_line = "🔍 Nansen listener: active (Telethon)\n"
 
+                champagne_eval_line = ""
+                if self.cfg.champagne_eval.enabled:
+                    champagne_eval_line = "• Champagne eval (10m)\n"
+                paper_line = ""
+                if self.cfg.paper_trading.enabled:
+                    champagne_eval_line = champagne_eval_line  # keep
+                    paper_line = "• Paper trading (5m)\n"
+                conviction_line = ""
+                if self.cfg.multi_conviction.enabled:
+                    conviction_line = "• Multi-wallet conviction (5m)\n"
+
                 await bot.send_message(
                     chat_id=self._notifier.cfg.chat_id,
                     text=(
@@ -1236,8 +1825,11 @@ class Tracker:
                         "• Eval pipeline (10s)\n"
                         "• PID outcome tracker (5m)\n"
                         "• Wallet sync (1h)\n"
-                        "• Wallet monitor (60s)\n\n"
-                        "🤖 Interactive bot: /menu\n"
+                        "• Wallet monitor (60s)\n"
+                        f"{champagne_eval_line}"
+                        f"{paper_line}"
+                        f"{conviction_line}"
+                        "\n🤖 Interactive bot: /menu\n"
                         "Database: PostgreSQL\n"
                         "Alerts will fire when gems are detected."
                     ),

@@ -4,36 +4,39 @@ You are working on **Base Sleuth**, an autonomous hidden-gem discovery agent for
 
 ## Before doing ANYTHING, read these files for context:
 
-1. `base-sleuth/SKILL.md` — Core strategy, pipeline architecture, scoring weights, trading rules
-2. `base-sleuth/references/clanker_intel.md` — API quirks, pagination, response shapes, ecosystem data
-3. `base-sleuth/references/strategy_evolution.md` — Current strategy version and active parameters
-4. `base-sleuth/references/token_blacklist.md` — Patterns and deployers to avoid
-5. `base-sleuth/references/wallet_watchlist.md` — Smart money wallets being tracked
+1. `.github/base-sleuth/SKILL.md` — Core strategy, pipeline architecture, scoring weights, trading rules
+2. `.github/base-sleuth/references/clanker_intel.md` — API quirks, pagination, response shapes, ecosystem data
+3. `.github/base-sleuth/references/strategy_evolution.md` — Current strategy version and active parameters
+4. `.github/base-sleuth/references/token_blacklist.md` — Patterns and deployers to avoid
+5. `.github/base-sleuth/references/wallet_watchlist.md` — Smart money wallets being tracked
 
 ## Project Architecture
 
-- **4 async loops**: firehose (30s), champagne scanner (120s), breakout scanner (180s), eval pipeline (10s)
+- **12 async loops**: firehose (30s), champagne scanner (120s), breakout scanner (180s), gainers scanner (180s), eval pipeline (10s), PID outcome tracker (60s), wallet sync (300s), wallet monitor (120s), Nansen Telethon listener (persistent), champagne eval (600s), paper trading (300s), multi-wallet conviction (300s)
 - **5-stage scoring**: pre-filter → reject gate → DEX metrics → momentum → smart money → context
 - **Bankr detection**: 92% of Clanker launches are Bankr bot spam — auto-skipped via description parsing
 - **Champagne tag**: Only 0.02% of tokens, but 58% have real liquidity — highest priority signal
 - **Breakout scanner**: Uses DexScreener trending/boosted/profiles to find delayed movers on Base
+- **Smart wallet tracking**: Arkham API + Nansen bot signals for wallet activity monitoring
+- **Live DEX data**: All Telegram messages include MCap, FDV, Liquidity, Price from DexScreener
 
 ## Key Files
 
 | File | Role |
 |------|------|
-| `clanker_tracker/main.py` | 4-loop async orchestrator (firehose, champagne, breakout, eval) |
+| `clanker_tracker/main.py` | 12-loop async orchestrator |
 | `clanker_tracker/filters.py` | Pre-filter + 5-stage scoring pipeline |
 | `clanker_tracker/clanker_client.py` | Cursor-based API polling + champagne scan + breakout scanner |
-| `clanker_tracker/models.py` | SQLAlchemy async ORM (Token, TokenContext, TokenMetrics) |
+| `clanker_tracker/models.py` | SQLAlchemy async ORM (Token, TokenContext, TokenMetrics, SmartWallet, WalletSwap, PaperPosition) |
 | `clanker_tracker/config.py` | Pydantic config with all thresholds and weights |
-| `clanker_tracker/notifier.py` | Telegram alerts with badges, score breakdown, and inline buttons |
+| `clanker_tracker/notifier.py` | Telegram alerts with live DEX data (4 types: alert, wallet buy, conviction, nansen) |
 | `clanker_tracker/bot_commands.py` | Interactive Telegram bot (commands, inline keyboard, force scan) |
 | `clanker_tracker/context_resolver.py` | Origin tracing (social URLs → page scrape → DDG) |
+| `clanker_tracker/nansen_listener.py` | Telethon-based NansenBot listener for wallet signals |
 | `config.example.yaml` | All configurable settings with comments |
 | `data/smart_money_wallets.txt` | Machine-readable wallet list for Stage 4 |
 | `alembic/` | PostgreSQL schema migrations (Alembic) |
-| `docker-compose.yml` | PostgreSQL + bot deployment stack |
+| `docker-compose.yml` | PostgreSQL + bot deployment stack (source code volume-mounted) |
 | `Dockerfile` | Production container image |
 
 ## Clanker API Facts (IMPORTANT — don't get these wrong)
@@ -51,6 +54,7 @@ You are working on **Base Sleuth**, an autonomous hidden-gem discovery agent for
 - **PostgreSQL** (asyncpg) for production, SQLite for dev/testing
 - **Alembic** for database schema migrations
 - **Docker Compose** for 24/7 deployment (PostgreSQL + bot containers)
+- **Telethon** for NansenBot Telegram listener
 - Pydantic config, structlog logging
 - `python-telegram-bot` for notifications, `BeautifulSoup` for scraping
 
@@ -58,8 +62,17 @@ You are working on **Base Sleuth**, an autonomous hidden-gem discovery agent for
 
 - Always use async/await patterns — the entire codebase is async
 - Use `structlog` for logging, never `print()`
+- Use `logger.warning()` or `logger.info()` for diagnostics — `logger.debug()` is invisible at default INFO level
 - All new config fields go in `config.py` (Pydantic) AND `config.example.yaml`
 - New scoring signals should be added as a stage in `filters.py`
 - New DB columns require an Alembic migration in `alembic/versions/`
-- When updating strategy, also update `base-sleuth/references/strategy_evolution.md`
-- Keep `base-sleuth/SKILL.md` in sync with any pipeline changes
+- When updating strategy, also update `.github/base-sleuth/references/strategy_evolution.md`
+- Keep `.github/base-sleuth/SKILL.md` in sync with any pipeline changes
+
+## Deployment
+
+- Source code is **volume-mounted** in Docker: `./clanker_tracker:/app/clanker_tracker:ro`
+- Python file changes → `docker compose restart bot` (no rebuild needed)
+- Changes to `requirements.txt`, `Dockerfile`, `alembic/`, or `data/` → `docker compose up -d --build bot`
+- `docker compose restart` does NOT rebuild the image — only picks up volume-mounted source
+- Always verify with `docker compose logs bot --tail 20` after deploy

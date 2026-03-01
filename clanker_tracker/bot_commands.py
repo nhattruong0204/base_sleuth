@@ -40,7 +40,7 @@ from telegram.ext import (
 )
 from sqlalchemy import func, select
 
-from .models import AlertOutcome, SmartWallet, Token, TokenContext, TokenMetrics, WalletSwap
+from .models import AlertOutcome, PaperPosition, SmartWallet, Token, TokenContext, TokenMetrics, WalletSwap
 from .nansen_listener import NansenIngestor, parse_nansen_message
 
 if TYPE_CHECKING:
@@ -78,6 +78,9 @@ def _main_menu_keyboard() -> InlineKeyboardMarkup:
         ],
         [
             InlineKeyboardButton("👛 Wallets", callback_data="wallets"),
+            InlineKeyboardButton("📝 Positions", callback_data="positions"),
+        ],
+        [
             InlineKeyboardButton("❓ Help", callback_data="help"),
         ],
     ])
@@ -264,6 +267,19 @@ async def cmd_analysis(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         )
 
 
+async def cmd_positions(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /positions — paper trading portfolio dashboard."""
+    tracker: Tracker = context.bot_data["tracker"]
+    text = await _build_positions_text(tracker)
+    for chunk in _split_message(text):
+        await update.message.reply_text(
+            chunk,
+            parse_mode=ParseMode.HTML,
+            reply_markup=_back_keyboard(),
+            disable_web_page_preview=True,
+        )
+
+
 # ──────────────────────────────────────────────────────────────────
 # Callback query handler (inline button presses)
 # ──────────────────────────────────────────────────────────────────
@@ -400,6 +416,23 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             disable_web_page_preview=True,
         )
         # Additional chunks sent as new messages
+        for chunk in chunks[1:]:
+            await query.message.reply_text(
+                chunk,
+                parse_mode=ParseMode.HTML,
+                reply_markup=_back_keyboard(),
+                disable_web_page_preview=True,
+            )
+
+    elif data == "positions":
+        text = await _build_positions_text(tracker)
+        chunks = _split_message(text)
+        await query.edit_message_text(
+            chunks[0],
+            parse_mode=ParseMode.HTML,
+            reply_markup=_back_keyboard(),
+            disable_web_page_preview=True,
+        )
         for chunk in chunks[1:]:
             await query.message.reply_text(
                 chunk,
@@ -748,6 +781,103 @@ async def _build_wallets_text(tracker: Tracker) -> str:
     return "\n".join(lines)
 
 
+async def _build_positions_text(tracker: Tracker) -> str:
+    """Build paper trading portfolio dashboard."""
+    if not tracker.cfg.paper_trading.enabled:
+        return (
+            "📝 <b>Paper Trading</b>\n\n"
+            "⚠️ Paper trading is <b>disabled</b>.\n\n"
+            "To enable, set <code>paper_trading.enabled: true</code> in config.yaml"
+        )
+
+    async with tracker._session_factory() as session:
+        # Open positions
+        open_stmt = (
+            select(PaperPosition)
+            .where(PaperPosition.status == "open")
+            .order_by(PaperPosition.opened_at.desc())
+            .limit(15)
+        )
+        open_result = await session.execute(open_stmt)
+        open_positions = open_result.scalars().all()
+
+        # Count open
+        open_count_r = await session.execute(
+            select(func.count()).select_from(PaperPosition).where(PaperPosition.status == "open")
+        )
+        open_count = open_count_r.scalar() or 0
+
+        # Closed positions stats
+        closed_stmt = (
+            select(
+                func.count().label("total"),
+                func.sum(PaperPosition.realized_pnl_usd).label("total_pnl"),
+                func.avg(PaperPosition.realized_pnl_usd).label("avg_pnl"),
+            )
+            .select_from(PaperPosition)
+            .where(PaperPosition.status != "open")
+        )
+        closed_r = await session.execute(closed_stmt)
+        closed = closed_r.one()
+        closed_total = closed.total or 0
+        total_pnl = closed.total_pnl or 0.0
+        avg_pnl = closed.avg_pnl or 0.0
+
+        # Win rate (closed with positive PnL)
+        wins_r = await session.execute(
+            select(func.count()).select_from(PaperPosition)
+            .where(PaperPosition.status != "open")
+            .where(PaperPosition.realized_pnl_usd > 0)
+        )
+        wins = wins_r.scalar() or 0
+        win_rate = (wins / closed_total * 100) if closed_total > 0 else 0.0
+
+        # Status breakdown
+        status_r = await session.execute(
+            select(PaperPosition.status, func.count())
+            .group_by(PaperPosition.status)
+        )
+        status_counts = {row[0]: row[1] for row in status_r.all()}
+
+    pnl_emoji = "🟢" if total_pnl >= 0 else "🔴"
+    lines = [
+        "📝 <b>Paper Trading Dashboard</b>",
+        "",
+        f"📊 <b>Portfolio Summary</b>",
+        f"  Open: <b>{open_count}</b>  |  Closed: <b>{closed_total}</b>",
+        f"  {pnl_emoji} Total PnL: <b>${total_pnl:+,.2f}</b>",
+        f"  Avg PnL/trade: <b>${avg_pnl:+,.2f}</b>",
+        f"  Win rate: <b>{win_rate:.1f}%</b> ({wins}/{closed_total})",
+        "",
+        f"📋 <b>Exit Breakdown:</b>",
+        f"  🎯 TP1 (+50%): {status_counts.get('tp1', 0)}",
+        f"  🎯 TP2 (+100%): {status_counts.get('tp2', 0)}",
+        f"  🎯 TP3 (+300%): {status_counts.get('tp3', 0)}",
+        f"  🛑 SL (-30%): {status_counts.get('sl', 0)}",
+        f"  ⏰ Time stop: {status_counts.get('time_stop', 0)}",
+        "",
+    ]
+
+    if open_positions:
+        lines.append("<b>📈 Open Positions (latest 15):</b>")
+        for pos in open_positions:
+            token = pos.token
+            name = _esc(token.name or token.symbol or "???")[:20]
+            entry_p = pos.entry_price_usd or 0
+            current_p = pos.current_price_usd or entry_p
+            pnl_pct = ((current_p - entry_p) / entry_p * 100) if entry_p > 0 else 0
+            arrow = "🟢" if pnl_pct >= 0 else "🔴"
+            mcap_str = f"${pos.last_check_mcap / 1000:.0f}K" if pos.last_check_mcap and pos.last_check_mcap < 1_000_000 else f"${pos.last_check_mcap / 1_000_000:.1f}M" if pos.last_check_mcap else "?"
+            age_h = (datetime.now(timezone.utc) - pos.opened_at).total_seconds() / 3600 if pos.opened_at else 0
+            lines.append(
+                f"  {arrow} <b>{name}</b> — {pnl_pct:+.1f}% | MCap {mcap_str} | {age_h:.1f}h"
+            )
+    else:
+        lines.append("<i>No open positions</i>")
+
+    return "\n".join(lines)
+
+
 def _build_help_text() -> str:
     """Build help text with all available commands."""
     return (
@@ -764,7 +894,8 @@ def _build_help_text() -> str:
         "<b>Analytics:</b>\n"
         "/realpnl <i>days</i> — Real-time PnL report (1/7/14 days)\n"
         "/analysis — Full token profitability scan (live prices)\n"
-        "/wallets — Smart wallet tracking summary\n\n"
+        "/wallets — Smart wallet tracking summary\n"
+        "/positions — Paper trading portfolio dashboard\n\n"
         "<b>Browse:</b>\n"
         "🍾 Champagne — View champagne-tagged tokens\n"
         "📈 Breakouts — View breakout-detected tokens\n\n"
@@ -1437,6 +1568,7 @@ def build_telegram_app(bot_token: str, tracker: Tracker) -> Application:
     app.add_handler(CommandHandler("realpnl", cmd_realpnl))
     app.add_handler(CommandHandler("analysis", cmd_analysis))
     app.add_handler(CommandHandler("wallets", cmd_wallets))
+    app.add_handler(CommandHandler("positions", cmd_positions))
 
     # Register callback query handler for all inline buttons
     app.add_handler(CallbackQueryHandler(button_callback))
