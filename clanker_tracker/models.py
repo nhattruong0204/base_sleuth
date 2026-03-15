@@ -307,6 +307,12 @@ class AlertOutcome(Base):
         Float, comment="Best mcap vs alert mcap, as %",
     )
 
+    # Telegram message tracking — for reply threading
+    alert_message_id: Mapped[Optional[int]] = mapped_column(
+        Integer,
+        comment="Telegram message_id of the original alert — used for reply threading",
+    )
+
     # Milestone tracking — ATH + multiplier progress
     ath_mcap: Mapped[Optional[float]] = mapped_column(
         Float, comment="All-time high market cap observed since alert",

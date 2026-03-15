@@ -735,7 +735,7 @@ class Tracker:
                                     "current_mcap": current_mcap or 0,
                                     "current_liq": current_liq or 0,
                                     "days_since_alert": days_since,
-                                })
+                                }, reply_to_message_id=outcome.alert_message_id)
                                 continue
                         else:
                             # Token recovered — reset dead countdown
@@ -780,7 +780,7 @@ class Tracker:
                                         "ath_mcap": current_mcap,
                                         "multiplier": int(current_mcap / alert_ref),
                                         "pnl_pct": pnl_pct,
-                                    })
+                                    }, reply_to_message_id=outcome.alert_message_id)
                                     outcome.milestone_notified_at = now
                                     milestones_sent += 1
 
@@ -805,7 +805,7 @@ class Tracker:
                                     "ath_mcap": outcome.ath_mcap,
                                     "multiplier": current_x,
                                     "pnl_pct": pnl_pct,
-                                })
+                                }, reply_to_message_id=outcome.alert_message_id)
                                 outcome.last_milestone_x = current_x
                                 outcome.milestone_notified_at = now
                                 milestones_sent += 1
@@ -986,6 +986,9 @@ class Tracker:
                                     alert_liq=m.liquidity_usd,
                                     alert_vol_1h=m.volume_1h_usd,
                                     alert_buys_1h=m.buys_1h,
+                                    alert_message_id=(
+                                        sent if isinstance(sent, int) and not isinstance(sent, bool) else None
+                                    ),
                                 )
                                 session.add(outcome)
 
@@ -1299,6 +1302,7 @@ class Tracker:
                                 )
 
                                 # Record alert outcome for PID loop
+                                # sent is the Telegram message_id (int) on success
                                 outcome = AlertOutcome(
                                     token_id=token.id,
                                     alert_score=filt_result.final_score,
@@ -1316,6 +1320,9 @@ class Tracker:
                                     ),
                                     alert_buys_1h=(
                                         metrics.buys_1h if metrics else None
+                                    ),
+                                    alert_message_id=(
+                                        sent if isinstance(sent, int) and not isinstance(sent, bool) else None
                                     ),
                                 )
                                 session.add(outcome)

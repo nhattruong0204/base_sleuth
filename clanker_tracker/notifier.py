@@ -113,8 +113,11 @@ class TelegramNotifier:
         result: FilterResult,
         *,
         nansen_buys: list[dict] | None = None,
-    ) -> bool:
-        """Send a Telegram alert for *token*. Returns True on success.
+    ) -> int | bool:
+        """Send a Telegram alert for *token*.
+
+        Returns the Telegram message_id (int) on success — used for reply
+        threading in milestone alerts.  Returns False on failure.
 
         Args:
             nansen_buys: Optional list of dicts with keys
@@ -131,7 +134,7 @@ class TelegramNotifier:
 
         try:
             async with Bot(token=self.cfg.bot_token) as bot:
-                await bot.send_message(
+                msg = await bot.send_message(
                     chat_id=self.cfg.chat_id,
                     text=message,
                     parse_mode=ParseMode.HTML,
@@ -139,8 +142,8 @@ class TelegramNotifier:
                     disable_notification=self.cfg.disable_notification,
                     reply_markup=buttons,
                 )
-            logger.info("telegram.sent", token=token.symbol, score=result.final_score)
-            return True
+            logger.info("telegram.sent", token=token.symbol, score=result.final_score, message_id=msg.message_id)
+            return msg.message_id
         except TelegramError as exc:
             logger.error("telegram.send.failed", token=token.symbol, error=str(exc))
             return False
@@ -644,8 +647,17 @@ class TelegramNotifier:
     # Milestone alert — ATH / multiplier milestone for alerted tokens
     # ------------------------------------------------------------------
 
-    async def notify_milestone(self, event: dict) -> bool:
+    async def notify_milestone(
+        self,
+        event: dict,
+        *,
+        reply_to_message_id: int | None = None,
+    ) -> bool:
         """Send alert when a token reaches a new ATH or multiplier milestone.
+
+        When *reply_to_message_id* is provided, the milestone message is
+        sent as a reply to the original alert — creating a visible thread
+        so users can track each token's performance from the alert.
 
         event keys:
             event_type: 'ath' | 'multiplier'
@@ -735,6 +747,7 @@ class TelegramNotifier:
                     parse_mode=ParseMode.HTML,
                     disable_web_page_preview=True,
                     reply_markup=buttons,
+                    reply_to_message_id=reply_to_message_id,
                 )
             logger.info(
                 "telegram.milestone",
@@ -742,9 +755,30 @@ class TelegramNotifier:
                 token=token_sym,
                 multiplier=multiplier,
                 mcap=current_mcap,
+                reply_to=reply_to_message_id,
             )
             return True
         except TelegramError as exc:
+            # If reply fails (e.g. original message deleted), retry without reply
+            if reply_to_message_id:
+                try:
+                    async with Bot(token=self.cfg.bot_token) as bot:
+                        await bot.send_message(
+                            chat_id=self.cfg.chat_id,
+                            text=message,
+                            parse_mode=ParseMode.HTML,
+                            disable_web_page_preview=True,
+                            reply_markup=buttons,
+                        )
+                    logger.warning(
+                        "telegram.milestone.reply_fallback",
+                        token=token_sym,
+                        original_error=str(exc),
+                    )
+                    return True
+                except TelegramError as exc2:
+                    logger.error("telegram.milestone.failed", error=str(exc2))
+                    return False
             logger.error("telegram.milestone.failed", error=str(exc))
             return False
 
@@ -752,8 +786,16 @@ class TelegramNotifier:
     # Dead token notification — token marked as dead
     # ------------------------------------------------------------------
 
-    async def notify_dead_token(self, event: dict) -> bool:
+    async def notify_dead_token(
+        self,
+        event: dict,
+        *,
+        reply_to_message_id: int | None = None,
+    ) -> bool:
         """Send notification when a token is marked as dead.
+
+        When *reply_to_message_id* is provided, the dead token message is
+        sent as a reply to the original alert.
 
         event keys: token_name, token_symbol, token_address,
                     alert_mcap, current_mcap, current_liq, days_since_alert
@@ -788,10 +830,31 @@ class TelegramNotifier:
                     parse_mode=ParseMode.HTML,
                     disable_web_page_preview=True,
                     disable_notification=True,  # Silent for dead tokens
+                    reply_to_message_id=reply_to_message_id,
                 )
-            logger.info("telegram.dead_token", token=token_sym)
+            logger.info("telegram.dead_token", token=token_sym, reply_to=reply_to_message_id)
             return True
         except TelegramError as exc:
+            # If reply fails (e.g. original message deleted), retry without reply
+            if reply_to_message_id:
+                try:
+                    async with Bot(token=self.cfg.bot_token) as bot:
+                        await bot.send_message(
+                            chat_id=self.cfg.chat_id,
+                            text=message,
+                            parse_mode=ParseMode.HTML,
+                            disable_web_page_preview=True,
+                            disable_notification=True,
+                        )
+                    logger.warning(
+                        "telegram.dead_token.reply_fallback",
+                        token=token_sym,
+                        original_error=str(exc),
+                    )
+                    return True
+                except TelegramError as exc2:
+                    logger.error("telegram.dead_token.failed", error=str(exc2))
+                    return False
             logger.error("telegram.dead_token.failed", error=str(exc))
             return False
 
