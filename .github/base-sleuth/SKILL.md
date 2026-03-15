@@ -102,12 +102,13 @@ Breakout discovery endpoints (60 req/min each):
 - **DexScreener Boost API** — tokens paying for promoted visibility = marketing signal
 - **Clanker token page** (https://www.clanker.world/clanker/{addr}) — origin context scraping
 - **DuckDuckGo fallback** — search `$SYMBOL bankrbot site:x.com` for origin tweets
+- **Binance Skills Hub** (https://developers.binance.com/en/skills) — Token security audit, trending ranks, social hype, KOL/smart money holder data (all public, no API key)
 
 ---
 
 ## Scanning Architecture
 
-The codebase runs **twelve concurrent async loops**:
+The codebase runs **seventeen concurrent async loops**:
 
 ### Loop 1 — Firehose (every 30s)
 ```
@@ -137,6 +138,23 @@ Sources:
 Filters: chainId=base, liq≥$10K, vol24h≥$5K, momentum required.
 Cross-references against DB to avoid re-alerting.
 Breakout tokens get +0.10 score bonus (trending signal).
+```
+
+### Loop 3.5 — Binance Trending Scanner (every 180s)
+```
+Discovery loop using Binance Skills Hub public APIs (no key needed).
+Fetches three data sources in parallel:
+  1. Unified Token Rank (trending, chainId=8453)
+  2. Unified Token Rank (top search, chainId=8453)
+  3. Social Hype Leaderboard (sentiment-ranked, chainId=8453)
+
+Merges results, dedupes vs DB, ingests new tokens for scoring.
+Binance trending tokens get +0.05 score bonus.
+Skips known blue-chip/infrastructure addresses.
+
+During scoring, enriches each token with:
+  - Security Audit: honeypot/scam/rug detection (reject HIGH/BLOCKED)
+  - Dynamic Data: KOL holders, smart money %, pro holders
 ```
 
 ### Loop 4 — Eval Pipeline (every 10s)
@@ -211,6 +229,51 @@ Detects tokens bought by 2+ distinct tracked wallets within 6h.
 Fires high-conviction alerts with wallet count + details.
 Auto-ingests tokens not in DB if DexScreener shows liq ≥ $10K.
 Reverse logic: starts from wallet buys, not token discovery.
+```
+
+### Loop 13 — Token Flow Monitor (every 5m)
+```
+Monitors fund flows for alerted tokens with open paper positions.
+Uses Arkham /token/top_flow (heavy endpoint, 1 req/sec) to detect:
+  - Dump warnings: large outflows from whales/funds (→ sell signal)
+  - Accumulation signals: sustained inflows from smart money (→ hold/buy)
+Sends Telegram alerts with entity names, USD amounts, and direction.
+Checks up to 5 tokens per cycle to respect rate limits.
+```
+
+### Loop 14 — Portfolio Watch (every 10m)
+```
+Surveils top-tier tracked wallet portfolios via Arkham /balances/address.
+Detects new Base token positions taken by highest-confidence wallets.
+Cross-references with tracked tokens for conviction signals.
+Checks top 30 wallets per cycle, minimum $500 position threshold.
+New positions in tracked tokens trigger conviction alerts.
+```
+
+### Loop 15 — Milestone Tracker (every 5m)
+```
+Monitors all alerted, non-dead tokens for price milestones.
+Batch-fetches live DEX data via DexScreener (30 per call).
+Compares current MCap with alert-time FDV/MCap to detect:
+  - New ATH (all-time high) — notifies when >10% above previous ATH (1h cooldown)
+  - Multiplier milestones — 2x, 3x, 4x, ... of alert FDV → Telegram alert
+Dead token cleanup:
+  - Marks tokens dead when liq < $200 or mcap < $500 for 24h continuously
+  - Sends 💀 death notification, stops monitoring
+  - Recovery resets countdown (token must be below for full 24h)
+  - Tokens older than 30 days auto-expire from tracking
+```
+
+### Loop 16 — Gate-Pending Re-Scan (every 10m)
+```
+Catches missed gems that scored well but had low MCap/Liq at scan time.
+When eval pipeline scores a token above threshold but MCap < $25K or Liq < $5K:
+  - Token is marked gate_pending=True instead of being permanently rejected
+  - Re-checks every 10 minutes via DexScreener batch lookup
+  - If MCap/Liq grows above gates → sends the alert
+  - After 18 failed re-checks (3 hours) → gives up
+Data-driven: 107 tokens scored 0.45-0.88 were blocked by the old $50K MCap gate.
+Contract-address-aware duplicate detection prevents false positives.
 ```
 
 ### Deployment — 24/7 Docker Stack
@@ -308,12 +371,33 @@ Check if known profitable wallets are involved:
 | Conviction signal | Tracked wallet buys token already in our DB | Highest confidence — separate alert |
 | Multiple wallets | 2+ smart wallets holding same token | Compounding signal |
 
-**Arkham Intel Integration:**
+**Arkham Intel Integration (8 capabilities):**
 - Fetches wallets tagged 'fomo-user' from Arkham Intel API
 - Analyzes 1d/7d/30d PnL via historical USD balance snapshots
 - Monitors wallet swaps via /swaps endpoint for real-time buy detection
 - Sends wallet buy alerts and conviction alerts via Telegram
 - Auto-updates `data/smart_money_wallets.txt` for Stage 4 scoring
+- **Token Holder Intelligence**: Identifies top holders (funds, VCs, exchanges)
+  via /token/holders + batch /intelligence/address_enriched — scores holder quality
+- **Deployer Profiling**: Assesses deployer via /intelligence/contract — known
+  builder bonus, scam reject, proxy/serial deployer penalties
+- **Token Flow Monitoring**: Detects dump/accumulation patterns via /token/top_flow
+- **Portfolio Watch**: Surveils top wallet holdings via /balances/address
+
+**Arkham Scoring Adjustments (additive, in _compute_weighted_score):**
+| Signal | Adjustment | Condition |
+|--------|------------|----------|
+| Fund/VC holders (2+) | +0.12 | Token held by identified funds/VCs |
+| Fund/VC holders (1) | +0.06 | Single fund/VC holder |
+| Known entities (3+) | +0.08 | Multiple identifiable holders |
+| Concentration >80% top10 | -0.10 | Rug risk — few holders control supply |
+| Exchange hot wallets (5+) | -0.05 | Dump risk — CEX-ready tokens |
+| Single holder majority | -0.15 | Extreme concentration |
+| Known builder deployer | +0.10 | Deployer has positive Arkham entity |
+| Risky deployer | -0.10 | Deployer flagged as risky |
+| Scam deployer | 0.00 (reject) | Hard reject — score zeroed |
+| Proxy contract | -0.08 | Upgradeable = rug risk |
+| Serial deployer | -0.05 | Many deploys in short window |
 
 ### Stage 5 — Context Quality (Weight: 15%)
 

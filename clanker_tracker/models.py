@@ -95,6 +95,30 @@ class Token(Base):
     # Notification state
     alert_sent: Mapped[bool] = mapped_column(Boolean, default=False)
 
+    # Dead token tracking (milestone tracker cleanup)
+    is_dead: Mapped[bool] = mapped_column(
+        Boolean, default=False,
+        comment="Token marked dead by milestone tracker (liq < $200 or mcap < $500 for 24h)",
+    )
+    dead_since: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True),
+        comment="When the token was first detected as dead",
+    )
+
+    # Gate-pending re-scan (token passed scoring but MCap/Liq too low)
+    gate_pending: Mapped[bool] = mapped_column(
+        Boolean, default=False,
+        comment="Token passed scoring but failed MCap/Liq gate — pending re-check",
+    )
+    gate_check_count: Mapped[int] = mapped_column(
+        Integer, default=0,
+        comment="Number of times this token has been re-checked for gate passage",
+    )
+    last_gate_check: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True),
+        comment="When the token was last re-checked for gate passage",
+    )
+
     # Timestamps
     launched_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
     discovered_at: Mapped[datetime] = mapped_column(
@@ -121,6 +145,7 @@ class Token(Base):
         Index("ix_tokens_discovered", "discovered_at"),
         Index("ix_tokens_champagne", "is_champagne"),
         Index("ix_tokens_platform", "launch_platform"),
+        Index("ix_tokens_gate_pending", "gate_pending"),
     )
 
     def __repr__(self) -> str:
@@ -280,6 +305,19 @@ class AlertOutcome(Base):
     )
     mcap_change_pct: Mapped[Optional[float]] = mapped_column(
         Float, comment="Best mcap vs alert mcap, as %",
+    )
+
+    # Milestone tracking — ATH + multiplier progress
+    ath_mcap: Mapped[Optional[float]] = mapped_column(
+        Float, comment="All-time high market cap observed since alert",
+    )
+    last_milestone_x: Mapped[Optional[int]] = mapped_column(
+        Integer, default=0,
+        comment="Highest whole-number multiplier notified (0=none, 1=1x, 2=2x, ...)",
+    )
+    milestone_notified_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True),
+        comment="Timestamp of last milestone notification",
     )
 
     # Relationship

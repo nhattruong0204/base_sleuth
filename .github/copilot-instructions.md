@@ -12,24 +12,27 @@ You are working on **Base Sleuth**, an autonomous hidden-gem discovery agent for
 
 ## Project Architecture
 
-- **12 async loops**: firehose (30s), champagne scanner (120s), breakout scanner (180s), gainers scanner (180s), eval pipeline (10s), PID outcome tracker (60s), wallet sync (300s), wallet monitor (120s), Nansen Telethon listener (persistent), champagne eval (600s), paper trading (300s), multi-wallet conviction (300s)
-- **5-stage scoring**: pre-filter → reject gate → DEX metrics → momentum → smart money → context
+- **18 async loops**: firehose (30s), champagne scanner (120s), breakout scanner (180s), gainers scanner (180s), binance trending (180s), eval pipeline (10s), PID outcome tracker (60s), wallet sync (300s), wallet monitor (120s), Nansen Telethon listener (persistent), champagne eval (600s), paper trading (300s), multi-wallet conviction (300s), token flow monitor (300s), portfolio watch (600s), milestone tracker (300s), gate-pending re-scan (600s)
+- **5-stage scoring**: pre-filter → reject gate → DEX metrics → momentum → smart money → context + Binance audit/enrichment + Arkham holder intel/deployer profiling
 - **Bankr detection**: 92% of Clanker launches are Bankr bot spam — auto-skipped via description parsing
 - **Champagne tag**: Only 0.02% of tokens, but 58% have real liquidity — highest priority signal
 - **Breakout scanner**: Uses DexScreener trending/boosted/profiles to find delayed movers on Base
-- **Smart wallet tracking**: Arkham API + Nansen bot signals for wallet activity monitoring
+- **Smart wallet tracking**: Arkham API (8 capabilities: wallet sync, swap monitor, holder intel, deployer profiling, token flows, portfolio watch) + Nansen bot signals
 - **Live DEX data**: All Telegram messages include MCap, FDV, Liquidity, Price from DexScreener
 
 ## Key Files
 
 | File | Role |
 |------|------|
-| `clanker_tracker/main.py` | 12-loop async orchestrator |
-| `clanker_tracker/filters.py` | Pre-filter + 5-stage scoring pipeline |
+| `clanker_tracker/main.py` | 16-loop async orchestrator |
+| `clanker_tracker/filters.py` | Pre-filter + 5-stage scoring pipeline + Binance audit + Arkham intel enrichment |
 | `clanker_tracker/clanker_client.py` | Cursor-based API polling + champagne scan + breakout scanner |
+| `clanker_tracker/binance_client.py` | Binance Skills Hub client (trending, audit, dynamic data, search, wallet) |
+| `clanker_tracker/arkham_client.py` | Arkham Intel client (8 capabilities: wallet sync, swap monitor, holder intel, deployer profiling, token flows, portfolio watch) |
+| `clanker_tracker/wallet_monitor.py` | Smart wallet swap monitor + multi-wallet conviction detection |
 | `clanker_tracker/models.py` | SQLAlchemy async ORM (Token, TokenContext, TokenMetrics, SmartWallet, WalletSwap, PaperPosition) |
 | `clanker_tracker/config.py` | Pydantic config with all thresholds and weights |
-| `clanker_tracker/notifier.py` | Telegram alerts with live DEX data (4 types: alert, wallet buy, conviction, nansen) |
+| `clanker_tracker/notifier.py` | Telegram alerts with live DEX data (7 types: alert, wallet buy, conviction, nansen, flow, milestone, dead) |
 | `clanker_tracker/bot_commands.py` | Interactive Telegram bot (commands, inline keyboard, force scan) |
 | `clanker_tracker/context_resolver.py` | Origin tracing (social URLs → page scrape → DDG) |
 | `clanker_tracker/nansen_listener.py` | Telethon-based NansenBot listener for wallet signals |

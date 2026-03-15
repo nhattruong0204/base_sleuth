@@ -37,6 +37,7 @@ Requestor addresses (msg_sender) that repeatedly launch dead tokens.
 ## Pattern Blacklist — Base / Clanker Specific
 
 ### Naming Patterns to Avoid
+- **Platform name impersonation**: Tokens named CLAWNCH, CLANKER, UNISWAP, DEXSCREENER etc. — always scams that wash-trade to look legitimate. Auto-rejected in Stage 1 via `impersonation_names` config.
 - Exact copies of trending token names (copycat rugs)
 - Tokens with "SAFE", "MOON", "1000x" in name
 - Names that are just wallet address fragments

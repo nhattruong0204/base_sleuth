@@ -50,6 +50,30 @@ filtering:
     - fake
     - drain
 
+  # Platform/ecosystem name impersonation detection.
+  # Tokens named exactly after known platforms are scam tokens
+  # that game wash-trade metrics to look legitimate. Hard-rejected.
+  impersonation_names:
+    - clanker
+    - clawnch
+    - bankr
+    - uniswap
+    - dexscreener
+    - coinbase
+    - ethereum
+    - solana
+    - opensea
+    - metamask
+    - basescan
+    - etherscan
+    - aave
+    - compound
+    - aerodrome
+    - warpcast
+    - farcaster
+    - base chain
+    - basechain
+
   # ── Stage 2: DEX metrics thresholds ──────────────────
   min_pool_liquidity_usd: 3000          # Raised from 1K — too many dead tokens
   min_mcap_usd: 1000
@@ -87,9 +111,9 @@ filtering:
   firehose_score_penalty: 0.70         # Multiply firehose scores by this
 
   score_threshold: 0.45                # Minimum to trigger alert (lowered — bot detection makes scores honest)
-  min_alert_mcap_usd: 50000            # Hard MCap floor
+  min_alert_mcap_usd: 25000            # Hard MCap floor (lowered from 50K — gate-pending re-scan catches growth)
   min_alert_liquidity_usd: 5000        # Hard liquidity floor at alert time
-  duplicate_symbol_cooldown_seconds: 7200  # Don't alert same symbol within 2h
+  duplicate_symbol_cooldown_seconds: 86400  # Don't alert same symbol within 24h (contract-address aware)
   recheck_delay_seconds: 300           # Wait before DEX lookup (index time)
 
   # ── Firehose scoring skip ────────────────────────────
@@ -182,11 +206,11 @@ pid:
   min_samples: 50                      # Need 50+ classified outcomes before tuning (was 10)
   no_alert_decay_hours: 6              # Dead-man's switch: auto-lower threshold if no alerts for 6h
 
-# ── Arkham Intel — Smart Wallet Tracking ──────────────────
+# ── Arkham Intel — Smart Wallet Tracking + On-Chain Intelligence ───
 # Integrates with Arkham Intel API to discover and monitor
 # profitable wallets tagged 'fomo-user' on Base chain.
-# Generates alerts when tracked wallets buy new tokens,
-# and conviction signals when they buy tokens in our DB.
+# Also provides Token Holder Intelligence, Deployer Profiling,
+# Token Flow Monitoring, and Portfolio Watch for active tokens.
 arkham:
   enabled: false                       # Set to true once API key is configured
   api_key: null                        # or set ARKHAM_API_KEY env var
@@ -214,7 +238,32 @@ arkham:
 
   # Rate limiting
   rate_limit_per_second: 15            # Standard API rate limit
-  heavy_endpoint_delay: 1.1            # Delay for /swaps, /transfers (seconds)
+  heavy_endpoint_delay: 1.1            # Delay for /swaps, /transfers, /top_flow (seconds)
+
+  # Token Holder Intelligence (THI) — identify WHO holds a token
+  holder_intel_enabled: true           # Fetch + identify top holders during scoring
+  holder_known_entity_bonus: 0.08      # Bonus when Arkham-labeled holders present
+  holder_fund_vc_bonus: 0.12           # Bonus when fund/VC entities hold the token
+  holder_concentration_penalty: 0.10   # Penalty when top 10 own >80% of supply
+  holder_max_top10_pct: 80.0           # Concentration threshold (%)
+  holder_exchange_risk_penalty: 0.05   # Penalty for 3+ exchange addresses holding
+
+  # Deployer Profiling — identify WHO deployed the token contract
+  deployer_profiling_enabled: true     # Check deployer identity during scoring
+  deployer_known_builder_bonus: 0.10   # Bonus for known/reputable deployer
+  deployer_scam_reject: true           # Hard reject tokens with scam deployer tags
+  deployer_proxy_penalty: 0.08         # Penalty for upgradeable proxy contracts
+
+  # Token Flow Monitoring — dump/accumulation detection
+  flow_monitoring_enabled: true        # Monitor flows on alerted tokens
+  flow_poll_interval_seconds: 300      # Check interval (seconds)
+  flow_min_usd: 5000                   # Min USD flow from known entity to flag
+  flow_alert_threshold_usd: 10000      # Total flow to trigger alert
+
+  # Portfolio Watch — detect new positions from tracked wallets
+  portfolio_watch_enabled: true        # Periodically check smart wallet portfolios
+  portfolio_poll_interval_seconds: 600 # How often to scan portfolios (seconds)
+  portfolio_min_position_usd: 500      # Min position size to consider as signal
 
 # ── BaseScan Wallet Monitor ─────────────────────────────
 # On-chain wallet monitoring via BaseScan API.
@@ -288,6 +337,73 @@ multi_conviction:
   window_hours: 6                      # Time window for overlap detection
   auto_ingest_from_wallet_buy: true    # Auto-add tokens from wallet buys
   auto_ingest_min_liq: 10000           # Min liquidity to auto-ingest ($)
+
+# ── Binance Skills Hub ──────────────────────────────────
+# Integrates Binance Web3 Skills for Base chain intelligence.
+# All endpoints are public — no API key needed.
+# Docs: https://developers.binance.com/en/skills
+#
+# Provides:
+# 1. Trending scanner — discover tokens trending on Binance (chainId=8453)
+# 2. Social Hype     — social buzz rankings with AI sentiment summaries
+# 3. Token Audit     — honeypot / scam / rug detection before alerting
+# 4. Token Dynamic   — KOL / smart money / pro holder enrichment
+# 5. Token Search    — cross-chain token lookup
+# 6. Wallet Balance  — on-chain wallet positions
+binance_skills:
+  enabled: true                        # Enable Binance Skills Hub integration
+
+  # Trending scanner settings
+  trending_poll_interval_seconds: 180  # Scan every 3 minutes
+  trending_min_mcap: 10000             # Min MCap for trending discovery ($)
+  trending_max_mcap: 50000000          # Max MCap (skip blue chips)
+  trending_min_liquidity: 5000         # Min liquidity for discovery ($)
+  trending_score_bonus: 0.05           # Flat bonus for Binance trending tokens
+
+  # Token security audit (honeypot / scam / rug detection)
+  audit_enabled: true                  # Run Binance audit during scoring
+  audit_max_risk_level: 3              # Max allowed risk (0-1=LOW, 2-3=MED, 4=HIGH, 5=BLOCKED)
+  audit_high_tax_pct: 10.0             # Tax above this % triggers warning
+  audit_score_bonus: 0.05              # Bonus for LOW risk audit
+  audit_penalty: 0.15                  # Penalty for MEDIUM risk
+
+  # Enrichment (KOL / smart money / pro holder data)
+  enrich_enabled: true                 # Fetch rich holder data from Binance
+  kol_holder_bonus: 0.05               # Bonus when token has KOL holders
+  smart_money_holder_bonus: 0.08       # Bonus for Binance smart money holders
+
+  # Rate limiting
+  request_delay_seconds: 0.5           # Min delay between Binance API calls
+
+# ── Milestone Tracker ───────────────────────────────────
+# Monitors all alerted tokens for price milestones:
+# - ATH (all-time-high MCap) notifications
+# - Multiplier milestones (2x, 3x, 4x, ... of alert FDV/MCap)
+# - Dead token cleanup (removes tokens with no liquidity)
+milestone_tracker:
+  enabled: true                        # Enable milestone tracker loop
+  scan_interval_seconds: 300           # Scan every 5 minutes
+  dead_liq_threshold_usd: 200          # Liq below this → potentially dead ($)
+  dead_mcap_threshold_usd: 500         # MCap below this → potentially dead ($)
+  dead_confirmation_hours: 24          # Hours below threshold before marking dead
+  max_token_age_days: 30               # Stop tracking tokens older than 30 days
+  batch_size: 30                       # Max tokens per DexScreener batch (API limit)
+  notify_ath: true                     # Send alert on new all-time-high MCap
+  notify_multiplier: true              # Send alert on multiplier milestones
+  min_multiplier_notify: 2             # Start notifying from 2x (skip initial 1x)
+  ath_cooldown_seconds: 3600           # Min 1h between ATH alerts for same token
+
+# ── Gate-Pending Re-Scan ────────────────────────────────────
+# When a token passes scoring but fails the hard MCap/Liq gate,
+# it's marked gate_pending=True. This loop re-checks periodically
+# until the token grows past the gate or max_rechecks is reached.
+# Data-driven: 107 high-scoring tokens were blocked by the MCap
+# gate — many gems start small and pump later.
+gate_pending:
+  enabled: true                        # Enable gate-pending re-scan loop
+  recheck_interval_seconds: 600        # Re-check every 10 minutes
+  max_rechecks: 18                     # Give up after 18 attempts (= 3 hours)
+  batch_size: 30                       # Max tokens per DexScreener batch
 
 telegram:
   bot_token: null          # or set TELEGRAM_BOT_TOKEN env var

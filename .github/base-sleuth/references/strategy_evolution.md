@@ -6,10 +6,10 @@ This document tracks the evolution of the gem-hunting strategy based on paper tr
 
 ---
 
-## Current Strategy Version: 1.5
+## Current Strategy Version: 1.9
 
-**Last Updated**: 2026-02-15
-**Based on**: Production DB analysis of 289,775 tokens + 283 alerts + 18 gems
+**Last Updated**: 2026-03-15
+**Based on**: Production DB analysis (336K tokens, 474 alerts, 26 gems) + Missed Gem Analysis
 
 ### Active Scanning Strategy
 
@@ -30,6 +30,12 @@ This document tracks the evolution of the gem-hunting strategy based on paper tr
 | S5 Context | 0.15 | social links, origin URL |
 | Champagne Bonus | +0.15 | flat additive |
 | **Alert Threshold** | — | **≥ 0.45** |
+
+### Active Hard Gates (v1.9 — data-driven adjustments)
+- MCap gate: **$25K** (lowered from $50K — 107 high-scoring tokens were blocked)
+- Liquidity gate: **$5K**
+- Duplicate symbol: **contract-address aware** (same symbol, different contract → allowed)
+- Gate-pending re-scan: **enabled** (tokens that fail gates get re-checked every 10m for 3h)
 
 ### Active Exit Rules
 - Stop Loss: -30% (mandatory, never override)
@@ -326,6 +332,271 @@ ceiling, champagne only 3/390 alerted, 0 convictions fired.
 - `strategy_evolution.md` — This entry
 
 ---
+
+### Iteration #6 — 2026-03-03 — Binance Skills Hub Integration (v0.8.0)
+
+**Trigger**: Binance launched a public Skills Hub marketplace giving AI agents
+native access to crypto data — CEX rankings, DEX metrics, wallet tracking,
+security audits, and holder analysis. Multiple skills support Base chain (8453),
+providing data sources complementary to DexScreener and Arkham.
+
+**Problem Identified**: The scoring pipeline relied solely on DexScreener for
+DEX metrics and Arkham/Nansen for smart money signals. Binance Web3 Skills
+offer free, no-API-key endpoints with unique data not available elsewhere:
+- Token security audits (honeypot/scam/rug detection)
+- KOL, smart money, and pro holder counts/percentages
+- Social hype rankings with AI-generated sentiment summaries
+- Cross-platform trending tokens (Binance's own ranking algorithm)
+
+**Solution — Binance Skills Hub Integration**:
+
+New file: `binance_client.py` — Full client for 6 Binance Skills APIs:
+1. **Trending Scanner (new loop)** — Discovers Base tokens trending on Binance
+   using Unified Token Rank (rank_type=10,11) and Social Hype Leaderboard.
+   Polls every 180s, ingests new tokens for scoring.
+2. **Token Security Audit** — Pre-alert honeypot/scam detection. Tokens with
+   HIGH/BLOCKED risk get score zeroed. MEDIUM risk gets -0.15 penalty.
+   LOW risk gets +0.05 bonus. Tax > 10% triggers penalty.
+3. **Token Dynamic Data** — Enriches scoring with KOL holder count (+0.05),
+   Binance smart money holder count (+0.08), and pro holder bonus (+0.03).
+4. **Token Search** — Cross-chain token lookup by keyword/address.
+5. **Wallet Balance** — Query wallet holdings on Base (for future wallet
+   monitoring enhancement).
+6. **Social Hype** — Social buzz rankings with sentiment analysis.
+
+**Changes Made**:
+- `clanker_tracker/binance_client.py`: New module — `BinanceSkillsClient` +
+  `BinanceTrendingScanner` classes
+- `clanker_tracker/config.py`: Added `BinanceSkillsConfig` (26 settings)
+- `clanker_tracker/filters.py`: Binance audit + enrichment in score calculation
+  - `set_binance_client()` injection method
+  - `_compute_weighted_score()` extended with audit/enrichment bonuses
+- `clanker_tracker/main.py`: New `_binance_trending_loop()`, initialization
+- `config.yaml` / `config.example.yaml`: Full Binance Skills configuration
+- `.github/base-sleuth/references/strategy_evolution.md`: This entry
+
+**Scoring Impact**:
+- LOW risk audit: +0.05 bonus (verified safe contracts)
+- MEDIUM risk: -0.15 penalty (proceed with caution)
+- HIGH risk: score × 0.3 (heavy penalty)
+- BLOCKED: score = 0 (hard reject)
+- Tax > 10%: -0.10 penalty
+- KOL holders: +0.05 bonus
+- Smart money (Binance): +0.08 bonus
+- Pro holders (3+): +0.03 bonus
+- Binance trending discovery: +0.05 score bonus
+
+**Key Design Decisions**:
+- All Binance APIs are public — no API key required
+- Audit runs during scoring (after Stage 5, before final score)
+- Trending scanner is a separate loop (like breakout/gainers)
+- Uses same skip_addresses list as gainers scanner
+- Rate-limited at 0.5s between calls to be polite
+
+---
+
+### Iteration #7 — 2026-03-03 — Arkham Deep Intelligence Suite (v0.9.0)
+
+**Trigger**: Arkham Intel API provides 60+ endpoints for on-chain intelligence
+beyond basic wallet tracking. The existing integration only used
+`/intelligence/address` for wallet identification and `/swaps` for trade
+detection. Expanding to holder analysis, deployer profiling, and token flow
+monitoring adds institutional-grade intelligence to the scoring pipeline.
+
+**Problem Identified**: The scoring pipeline had blind spots:
+1. No insight into WHO holds a token (whales, funds, exchanges)
+2. No profiling of the deployer (known builder vs serial scammer)
+3. No monitoring of fund flows after alerts (dump detection)
+4. No portfolio surveillance of top wallets (new position discovery)
+
+**Solution — Arkham Deep Intelligence Suite (4 features)**:
+
+**1. Token Holder Intelligence (THI)**:
+Uses `GET /token/holders/{chain}/{address}` + `POST /intelligence/address_enriched/batch`
+to analyze the quality of a token's holder base:
+- Identifies known entities (funds, VCs, DAOs, exchanges) among top holders
+- Scores holder quality (0-1) based on entity type diversity
+- Detects concentration risk (top 10 holders owning >80%)
+- Flags exchange hot wallet dominance (dumping risk)
+- Integrated into `_compute_weighted_score()` as additive adjustments
+
+**2. Deployer Profiling**:
+Uses `GET /intelligence/contract/{chain}/{address}` + address enrichment
+to assess the deployer's reputation:
+- Identifies deployer entity (known builder → bonus, scam tag → reject)
+- Detects serial deployers (many deploys in short time → suspicious)
+- Checks proxy/upgradeable contracts (rug risk)
+- Risk levels: safe (+0.10), unknown (neutral), risky (-0.10), dangerous (reject)
+
+**3. Token Flow Monitoring (new loop)**:
+Uses `GET /token/top_flow/{chain}/{address}` (heavy endpoint, 1 req/sec)
+to monitor fund flows for alerted tokens with open paper positions:
+- Detects dump warnings: large outflows from whales/funds
+- Detects accumulation signals: sustained inflows from smart money
+- Sends Telegram alerts with entity names and USD amounts
+- Polls every 300s, checks up to 5 tokens per cycle
+
+**4. Portfolio Watch (new loop)**:
+Uses `GET /balances/address/{address}` to monitor top-tier wallet holdings:
+- Detects new Base token positions taken by highest-confidence wallets
+- Cross-references with tracked tokens for conviction signals
+- Polls every 600s, checks top 5 wallets per cycle
+
+**Changes Made**:
+- `clanker_tracker/arkham_client.py`: 6 new methods on `ArkhamClient` +
+  new `TokenFlowMonitor` class (~600 lines added):
+  - `fetch_token_top_holders()`, `batch_identify_addresses()`,
+  - `fetch_contract_intel()`, `fetch_token_flows()`,
+  - `fetch_wallet_portfolio()`, `analyze_holder_quality()`,
+  - `profile_deployer()`, `TokenFlowMonitor.check_flows()`
+- `clanker_tracker/config.py`: ~60 new fields in `ArkhamConfig`
+  (THI, deployer, flow, portfolio settings)
+- `clanker_tracker/filters.py`: Arkham enrichment in `evaluate()` +
+  scoring adjustments in `_compute_weighted_score()`
+- `clanker_tracker/main.py`: `set_arkham_client()` wiring,
+  `TokenFlowMonitor` init, `_token_flow_loop()`, `_portfolio_watch_loop()`
+- `clanker_tracker/notifier.py`: `notify_flow_alert()` method
+- Config files updated with all new Arkham settings
+
+**Scoring Impact**:
+- Fund/VC holders (2+): +0.12 bonus (strongest holder signal)
+- Fund/VC holders (1): +0.06 bonus
+- Known entities (3+): +0.08 bonus
+- Concentration >80% top 10: -0.10 penalty
+- Exchange hot wallets (5+): -0.05 penalty
+- Single holder majority: -0.15 penalty
+- All unknown holders: -0.03 penalty
+- Known builder deployer: +0.10 bonus
+- Risky deployer: -0.10 penalty
+- Dangerous/scam deployer: score = 0.0 (hard reject)
+- Proxy contract: -0.08 penalty
+- Serial deployer: -0.05 penalty
+
+**New Loops**: 17 total (was 14)
+- Token flow monitor (300s) — dump/accumulation detection
+- Portfolio watch (600s) — wallet position surveillance
+- Milestone tracker (300s) — ATH + multiplier notifications + dead token cleanup
+
+---
+
+### Iteration #8 — 2026-03-15 — Milestone Tracker (v1.0.0)
+
+**Focus**: Post-alert token monitoring — detect price milestones, ATH, and clean up dead tokens.
+
+#### New Feature: Milestone Tracker Loop (every 5m)
+- Scans all alerted, non-dead tokens with AlertOutcome records
+- Batch-fetches live DEX data from DexScreener (30 per call)
+- Compares current MCap with alert-time FDV/MCap (prefers FDV as reference)
+- **ATH Detection**: Tracks all-time-high MCap per token
+  - Notifies when >10% above previous ATH
+  - 1-hour cooldown between ATH notifications per token
+- **Multiplier Milestones**: Detects whole-number multipliers (2x, 3x, 4x, ...)
+  - Starts notifying from 2x by default (configurable min_multiplier_notify)
+  - Only fires once per multiplier level (stored as last_milestone_x)
+- **Dead Token Cleanup**:
+  - Detects tokens with liquidity < $200 OR MCap < $500
+  - Requires 24h continuous below threshold before marking dead
+  - Recovery above thresholds resets the countdown
+  - Sends 💀 death notification, permanently stops monitoring
+  - Tokens older than 30 days auto-expire from tracking
+
+#### New Telegram Alert Types
+- 🏆 ATH notification — shows new ATH MCap, alert-time reference, gain %
+- 🚀 Multiplier milestone — shows current multiplier, MCap, gain %
+- 💀 Dead token — shows current vs alert MCap, days since alert
+
+#### DB Changes (Migration 006)
+- `alert_outcomes.ath_mcap` — all-time high MCap observed post-alert
+- `alert_outcomes.last_milestone_x` — highest whole-number multiplier notified
+- `alert_outcomes.milestone_notified_at` — timestamp of last milestone notification
+- `tokens.is_dead` — boolean, token marked dead by milestone tracker
+- `tokens.dead_since` — timestamp when token first dropped below thresholds
+
+#### Config: `MilestoneTrackerConfig` (12 fields)
+- scan_interval_seconds: 300
+- dead_liq_threshold_usd: 200
+- dead_mcap_threshold_usd: 500
+- dead_confirmation_hours: 24
+- max_token_age_days: 30
+- batch_size: 30
+- notify_ath: true
+- notify_multiplier: true
+- min_multiplier_notify: 2
+- ath_cooldown_seconds: 3600
+
+**New Loops**: 17 total (was 16)
+
+---
+
+### Iteration #9 — 2026-03-15 — Missed Gem Analysis & Gate-Pending Re-Scan (v1.1)
+
+**Focus**: Data-driven analysis of why high-scoring tokens were not alerted + system improvements.
+
+#### Production Data Analysis (336K tokens, 474 alerts, 26 gems)
+
+**Key Findings**:
+
+| Blocker | Tokens Blocked (score ≥ 0.45) | Avg Score | Max Score |
+|---------|------|-----------|-----------|
+| MCap gate ($50K) | 107 | 0.578 | 0.842 |
+| Duplicate symbol | 68 | 0.537 | 0.882 |
+| Score threshold | 471 | 0.408 | 0.593 |
+| Liquidity gate | 1 | 0.536 | N/A |
+
+**Root Cause**: The $50K MCap hard gate was the #1 missed gem blocker.
+- COOK scored 0.7471 with MCap $48,547 — just $1,453 below the gate
+- LANCER scored 0.8424 with MCap $14,891 — excellent token rejected
+- 107 tokens scored above threshold but were permanently rejected with NO re-check
+
+**Second Problem**: Duplicate symbol check blocked different contracts.
+- ToruCeoAI scored 0.8824 but blocked because a DIFFERENT contract with same symbol was alerted
+- 68 tokens with different contract addresses blocked by symbol-only matching
+
+#### Changes Made
+
+**1. Gate-Pending Re-Scan Loop (Loop 16, every 10m)**:
+- Tokens that pass scoring but fail MCap/Liq gate → `gate_pending=True`
+- New loop re-checks these tokens every 10 minutes
+- If MCap/Liq grows above gate → alert fires
+- Max 18 re-checks (3 hours) before giving up
+- Prevents the permanent-rejection problem that caused 107 missed gems
+
+**2. MCap Gate Lowered: $50K → $25K**:
+- Gem tokens were alerted at MCap as low as $51K (MONTRA)
+- Many gems start at $50-80K MCap — lowering catches them earlier
+- Combined with gate-pending re-scan, tokens starting at $10-25K still get re-checked
+
+**3. Duplicate Symbol Check Fixed: Contract-Address Aware**:
+- Old: Same `symbol` string → blocked (even if different contract)
+- New: Only blocks if same `contract_address` (true duplicate)
+- Different contracts with same symbol are different projects → now allowed
+- Prevents blocking 68+ legitimate tokens
+
+#### DB Changes (Migration 007)
+- `tokens.gate_pending` — boolean, token awaiting MCap/Liq gate re-check
+- `tokens.gate_check_count` — integer, number of re-check attempts
+- `tokens.last_gate_check` — timestamp of last re-check
+
+#### Config: `GatePendingConfig` (4 fields)
+- enabled: true
+- recheck_interval_seconds: 600
+- max_rechecks: 18
+- batch_size: 30
+
+#### Discovery Source Alert Rates (from DB analysis)
+| Source | Total Scored | Alerted | Alert % |
+|--------|-------------|---------|---------|
+| wallet_conviction | 37 | 24 | 64.9% |
+| community_takeover | 6 | 4 | 66.7% |
+| binance_trending | 71 | 39 | 54.9% |
+| profile | 591 | 289 | 48.9% |
+| boost_top | 9 | 3 | 33.3% |
+| binance_top_search | 107 | 27 | 25.2% |
+| binance_social_hype | 48 | 12 | 25.0% |
+| boost_latest | 69 | 16 | 23.2% |
+| firehose | 260,088 | 37 | 0.01% |
+
+**New Loops**: 18 total (was 17)
 
 <!--
 TEMPLATE FOR FUTURE ITERATIONS:

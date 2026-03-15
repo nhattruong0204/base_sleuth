@@ -60,10 +60,22 @@ class TokenFilter:
     def __init__(self, config: AppConfig, http: httpx.AsyncClient) -> None:
         self.cfg = config.filtering
         self.dex_cfg = config.dexscreener
+        self._binance_cfg = config.binance_skills
+        self._arkham_cfg = config.arkham
         self._http = http
         self._smart_wallets: set[str] = set()
         self._breakout_bonus: float = config.breakout.breakout_score_bonus
+        self._binance_client = None  # Set externally via set_binance_client()
+        self._arkham_client = None   # Set externally via set_arkham_client()
         self._load_smart_wallets()
+
+    def set_binance_client(self, client) -> None:
+        """Inject BinanceSkillsClient for audit + enrichment."""
+        self._binance_client = client
+
+    def set_arkham_client(self, client) -> None:
+        """Inject ArkhamClient for holder intelligence + deployer profiling."""
+        self._arkham_client = client
 
     def _load_smart_wallets(self) -> None:
         path = Path(self.cfg.smart_money_wallet_file)
@@ -156,9 +168,39 @@ class TokenFilter:
         result.stage_results.append(s5)
         result.stage_reached = 5
 
+        # ── Binance enrichment: security audit + holder data ──
+        binance_audit = None
+        binance_dynamic = None
+        if self._binance_client and self._binance_cfg.enabled:
+            if self._binance_cfg.audit_enabled and token.contract_address:
+                binance_audit = await self._binance_client.audit_token(
+                    token.contract_address,
+                )
+            if self._binance_cfg.enrich_enabled and token.contract_address:
+                binance_dynamic = await self._binance_client.fetch_token_dynamic(
+                    token.contract_address,
+                )
+
+        # ── Arkham enrichment: holder intelligence + deployer profiling ──
+        arkham_holders = None
+        arkham_deployer = None
+        if self._arkham_client and self._arkham_cfg.enabled:
+            if self._arkham_cfg.holder_intel_enabled and token.contract_address:
+                arkham_holders = await self._arkham_client.analyze_holder_quality(
+                    token.contract_address,
+                )
+            if self._arkham_cfg.deployer_profiling_enabled and token.contract_address:
+                arkham_deployer = await self._arkham_client.profile_deployer(
+                    token.contract_address,
+                )
+
         # ── Weighted score ──
         result.final_score = self._compute_weighted_score(
             token, s2, s3, s4, s5,
+            binance_audit=binance_audit,
+            binance_dynamic=binance_dynamic,
+            arkham_holders=arkham_holders,
+            arkham_deployer=arkham_deployer,
         )
 
         if result.final_score < self.cfg.score_threshold:
@@ -186,14 +228,34 @@ class TokenFilter:
 
     def _stage1_instant_reject(self, token: Token) -> StageResult:
         """Hard-reject tokens that are obvious trash."""
-        name_lower = (token.name or "").lower()
-        symbol_lower = (token.symbol or "").lower()
+        name_lower = (token.name or "").lower().strip()
+        symbol_lower = (token.symbol or "").lower().strip()
 
         # Scam keyword in name / symbol
         for kw in self.cfg.scam_keywords:
             if kw in name_lower or kw in symbol_lower:
                 return StageResult(
                     passed=False, score=0.0, reason=f"Scam keyword: {kw}",
+                )
+
+        # Platform/ecosystem name impersonation detection
+        # Tokens named "CLAWNCH", "CLANKER", "UNISWAP" etc. are scams
+        # that game wash-trade metrics to look legitimate.
+        for platform in self.cfg.impersonation_names:
+            platform_l = platform.lower()
+            # Exact match on name or symbol (stripped, case-insensitive)
+            if name_lower == platform_l or symbol_lower == platform_l:
+                return StageResult(
+                    passed=False,
+                    score=0.0,
+                    reason=f"Impersonation: {platform}",
+                )
+            # Also catch "$CLAWNCH" symbol variants and plurals
+            if symbol_lower in (platform_l, f"${platform_l}"):
+                return StageResult(
+                    passed=False,
+                    score=0.0,
+                    reason=f"Impersonation symbol: {platform}",
                 )
 
         return StageResult(passed=True, score=1.0)
@@ -524,14 +586,27 @@ class TokenFilter:
         s3: StageResult,
         s4: StageResult,
         s5: StageResult,
+        *,
+        binance_audit: dict | None = None,
+        binance_dynamic: dict | None = None,
+        arkham_holders: dict | None = None,
+        arkham_deployer: dict | None = None,
     ) -> float:
         """Weighted combination of stages 2–5 (stage 1 is pass/fail gate).
 
-        Weight philosophy (v3 — data-driven Feb 2026):
+        Weight philosophy (v5 — Mar 2026 with Binance Skills + Arkham Intel):
         - Metrics (2.0): Liquidity + volume are the primary survival signals
         - Momentum (1.5): Buying pressure confirms interest
         - Smart money (2.0): Whale wallets (when data available)
         - Context (0.3): Social links are baseline, NOT differentiators
+
+        Binance enrichment (additive):
+        - Security audit: bonus for LOW risk, penalty for MEDIUM+, reject HIGH
+        - KOL/smart money holders: bonus when detected via Binance
+
+        Arkham enrichment (additive):
+        - Holder intelligence: bonus for known entities / fund/VC holders
+        - Deployer profiling: bonus for known builders, reject scam deployers
 
         Source-aware penalties:
         - Firehose tokens get penalised (84% trash rate historically)
@@ -570,7 +645,100 @@ class TokenFilter:
         if getattr(token, "is_breakout", False):
             raw += self._breakout_bonus
 
-        return round(min(raw, 1.0), 4)
+        # ── Binance Skills enrichment (additive) ──
+        if binance_audit and self._binance_cfg.enabled:
+            risk = binance_audit.get("risk_level", -1)
+            risk_enum = binance_audit.get("risk_level_enum", "UNKNOWN")
+            buy_tax = binance_audit.get("buy_tax") or 0
+            sell_tax = binance_audit.get("sell_tax") or 0
+
+            if risk_enum == "BLOCKED" or risk >= 5:
+                # Severe risk — hard reject
+                raw = 0.0
+            elif risk_enum == "HIGH" or risk >= 4:
+                # High risk — heavy penalty
+                raw *= 0.3
+            elif risk_enum == "MEDIUM" or risk >= 2:
+                # Medium risk — moderate penalty
+                raw -= self._binance_cfg.audit_penalty
+            elif risk_enum == "LOW" or risk <= 1:
+                # Low risk — bonus for passing audit
+                raw += self._binance_cfg.audit_score_bonus
+
+            # Tax penalty
+            max_tax = max(buy_tax, sell_tax)
+            if max_tax >= self._binance_cfg.audit_high_tax_pct:
+                raw -= 0.10
+
+        if binance_dynamic and self._binance_cfg.enabled:
+            kol = binance_dynamic.get("kol_holders") or 0
+            sm = binance_dynamic.get("smart_money_holders") or 0
+            pro = binance_dynamic.get("pro_holders") or 0
+
+            if kol > 0:
+                raw += self._binance_cfg.kol_holder_bonus
+            if sm > 0:
+                raw += self._binance_cfg.smart_money_holder_bonus
+            if pro >= 3:
+                raw += 0.03  # Minor bonus for multiple pro holders
+
+        # ── Arkham holder intelligence (additive) ──
+        if arkham_holders and self._arkham_cfg.enabled:
+            holder_score = arkham_holders.get("holder_score", 0.0)
+            fund_vc = arkham_holders.get("fund_vc_count", 0)
+            conc = arkham_holders.get("concentration_top10", 0.0)
+            exchange_pct = arkham_holders.get("exchange_holders", 0)
+            risk_flags = arkham_holders.get("risk_flags") or []
+
+            # Fund/VC holders — strongest positive signal
+            if fund_vc >= 2:
+                raw += self._arkham_cfg.holder_fund_vc_bonus
+            elif fund_vc >= 1:
+                raw += self._arkham_cfg.holder_fund_vc_bonus * 0.5
+
+            # Known entity holders
+            known = arkham_holders.get("known_entities", 0)
+            if known >= 3:
+                raw += self._arkham_cfg.holder_known_entity_bonus
+
+            # Concentration risk — top 10 holders own too much
+            if conc > self._arkham_cfg.holder_max_top10_pct:
+                raw -= self._arkham_cfg.holder_concentration_penalty
+
+            # Exchange dumping risk — many holders are exchange hot wallets
+            if exchange_pct >= 5:
+                raw -= self._arkham_cfg.holder_exchange_risk_penalty
+
+            # Risk flags from holder analysis
+            if "single_holder_majority" in risk_flags:
+                raw -= 0.15  # Extreme concentration
+            if "all_unknown" in risk_flags:
+                raw -= 0.03  # No identifiable holders
+
+        # ── Arkham deployer profiling (additive) ──
+        if arkham_deployer and self._arkham_cfg.enabled:
+            risk_level = arkham_deployer.get("risk_level", "unknown")
+            deployer_score = arkham_deployer.get("deployer_score", 0.0)
+            tags = arkham_deployer.get("deployer_tags") or []
+
+            if risk_level == "dangerous" and self._arkham_cfg.deployer_scam_reject:
+                # Known scam deployer — hard reject
+                raw = 0.0
+            elif risk_level == "risky":
+                raw -= 0.10
+            elif risk_level == "safe" and deployer_score > 0.5:
+                # Known good builder
+                raw += self._arkham_cfg.deployer_known_builder_bonus
+
+            # Proxy contract penalty — upgradeable contracts carry rug risk
+            if arkham_deployer.get("is_proxy"):
+                raw -= self._arkham_cfg.deployer_proxy_penalty
+
+            # Serial deployer tag — many deploys in short time is suspicious
+            if arkham_deployer.get("is_serial_deployer"):
+                raw -= 0.05
+
+        return round(min(max(raw, 0.0), 1.0), 4)
 
     # ------------------------------------------------------------------
     # DexScreener integration (single token)

@@ -32,9 +32,10 @@ from .context_resolver import ContextResolver
 from .filters import TokenFilter
 from .models import AlertOutcome, PaperPosition, SmartWallet, Token, TokenMetrics, WalletSwap, create_engine, create_session_factory, init_db
 from .notifier import TelegramNotifier
-from .arkham_client import ArkhamClient, WalletTracker
+from .arkham_client import ArkhamClient, TokenFlowMonitor, WalletTracker
 from .wallet_monitor import WalletMonitor
 from .nansen_listener import NansenTelethonListener
+from .binance_client import BinanceSkillsClient, BinanceTrendingScanner
 
 logger = structlog.get_logger(__name__)
 
@@ -52,6 +53,11 @@ class Tracker:
             "poll": 0, "champagne": 0, "breakout": 0, "gainers": 0, "eval": 0, "outcome": 0,
             "wallet_sync": 0, "wallet_monitor": 0, "wallet_watch": 0, "nansen": 0,
             "champagne_eval": 0, "paper_trading": 0, "multi_conviction": 0,
+            "binance_trending": 0,
+            "token_flow": 0,
+            "portfolio_watch": 0,
+            "milestone_tracker": 0,
+            "gate_pending": 0,
         }
         self._MAX_BACKOFF = 300  # Cap backoff at 5 min
 
@@ -77,6 +83,9 @@ class Tracker:
         self._wallet_tracker: WalletTracker | None = None
         self._wallet_monitor: WalletMonitor | None = None
         self._nansen_listener: NansenTelethonListener | None = None
+        self._binance: BinanceSkillsClient | None = None
+        self._binance_scanner: BinanceTrendingScanner | None = None
+        self._flow_monitor: TokenFlowMonitor | None = None
         self._telegram_app = None  # python-telegram-bot Application
 
     async def start(self) -> None:
@@ -112,6 +121,17 @@ class Tracker:
         self._filter = TokenFilter(self.cfg, self._http)
         self._notifier = TelegramNotifier(self.cfg)
 
+        # Binance Skills Hub — trending scanner + audit + enrichment
+        self._binance = BinanceSkillsClient(self.cfg, self._http)
+        if self._binance.enabled:
+            self._binance_scanner = BinanceTrendingScanner(
+                self.cfg, self._binance, self._http,
+            )
+            self._filter.set_binance_client(self._binance)
+            logger.info("binance_skills.initialized", audit=self.cfg.binance_skills.audit_enabled, enrich=self.cfg.binance_skills.enrich_enabled)
+        else:
+            logger.info("binance_skills.disabled")
+
         # Arkham Intel — smart wallet tracking
         self._arkham = ArkhamClient(self.cfg, self._http)
         self._wallet_tracker = WalletTracker(
@@ -119,9 +139,19 @@ class Tracker:
         )
         if self._arkham.enabled:
             await self._wallet_tracker.load_tracked_wallets()
+            # Inject Arkham client into filter for holder + deployer scoring
+            self._filter.set_arkham_client(self._arkham)
+            # Token flow monitor for dump/accumulation detection
+            if self.cfg.arkham.flow_monitoring_enabled:
+                self._flow_monitor = TokenFlowMonitor(
+                    self.cfg, self._arkham, self._session_factory,
+                )
             logger.info(
                 "arkham.initialized",
                 wallets_loaded=len(self._wallet_tracker.tracked_wallets),
+                holder_intel=self.cfg.arkham.holder_intel_enabled,
+                deployer_profiling=self.cfg.arkham.deployer_profiling_enabled,
+                flow_monitoring=self.cfg.arkham.flow_monitoring_enabled,
             )
         else:
             logger.info("arkham.disabled", reason="no api_key or not enabled")
@@ -202,6 +232,10 @@ class Tracker:
         if self._arkham.enabled:
             loops.append(self._wallet_sync_loop())
             loops.append(self._wallet_monitor_loop())
+            if self._flow_monitor:
+                loops.append(self._token_flow_loop())
+            if self.cfg.arkham.portfolio_watch_enabled:
+                loops.append(self._portfolio_watch_loop())
         if self.cfg.wallet_monitor.enabled:
             loops.append(self._wallet_watch_loop())
         if self._nansen_listener and self._nansen_listener._running:
@@ -214,6 +248,18 @@ class Tracker:
             loops.append(self._paper_trading_loop())
         if self.cfg.multi_conviction.enabled:
             loops.append(self._multi_conviction_loop())
+
+        # v0.8 — Binance Skills Hub trending scanner
+        if self._binance and self._binance.enabled:
+            loops.append(self._binance_trending_loop())
+
+        # v1.0 — Milestone tracker (ATH + multiplier notifications + dead cleanup)
+        if self.cfg.milestone_tracker.enabled:
+            loops.append(self._milestone_tracker_loop())
+
+        # v1.1 — Gate-pending re-scan (catch tokens that grow past MCap/Liq gates)
+        if self.cfg.gate_pending.enabled:
+            loops.append(self._gate_pending_loop())
 
         loop_count = len(loops)
         logger.info("tracker.running", loops=loop_count, telegram_bot="active")
@@ -378,6 +424,611 @@ class Tracker:
                 logger.exception("gainers.error", backoff=self._backoff["gainers"])
 
             wait = interval + self._backoff_delay("gainers")
+            try:
+                await asyncio.wait_for(self._shutdown.wait(), timeout=wait)
+                break
+            except asyncio.TimeoutError:
+                pass
+
+    # ------------------------------------------------------------------
+    # Binance trending scanner loop — Base tokens trending on Binance
+    # ------------------------------------------------------------------
+
+    async def _binance_trending_loop(self) -> None:
+        """Periodically fetch trending / top-search / socially hyped tokens
+        from Binance Skills Hub and ingest new ones into the DB.
+
+        Uses three Binance data sources:
+        1. Unified Token Rank (trending rank_type=10, top search rank_type=11)
+        2. Social Hype Leaderboard (sentiment + social buzz)
+
+        Tokens found here enter the eval pipeline for full scoring,
+        including Binance security audit and enriched holder data.
+        """
+        if not self._binance or not self._binance.enabled:
+            logger.info("binance_trending.disabled")
+            return
+
+        interval = self.cfg.binance_skills.trending_poll_interval_seconds
+        # Initial delay to let firehose + breakout populate first
+        await asyncio.sleep(60)
+
+        while not self._shutdown.is_set():
+            try:
+                async with self._session_factory() as session:
+                    new_tokens = await self._binance_scanner.scan(session)
+                    await session.commit()
+                    if new_tokens:
+                        self._stats["tokens_discovered"] += len(new_tokens)
+                        logger.info(
+                            "binance_trending.batch",
+                            count=len(new_tokens),
+                            names=[t.symbol or t.name for t in new_tokens],
+                        )
+                self._backoff["binance_trending"] = 0
+            except Exception:
+                self._stats["errors"] += 1
+                self._backoff["binance_trending"] = min(
+                    self._backoff["binance_trending"] + 1, 10,
+                )
+                logger.exception(
+                    "binance_trending.error",
+                    backoff=self._backoff["binance_trending"],
+                )
+
+            wait = interval + self._backoff_delay("binance_trending")
+            try:
+                await asyncio.wait_for(self._shutdown.wait(), timeout=wait)
+                break
+            except asyncio.TimeoutError:
+                pass
+
+    # ------------------------------------------------------------------
+    # Token flow monitor loop — detect dump/accumulation patterns
+    # ------------------------------------------------------------------
+
+    async def _token_flow_loop(self) -> None:
+        """Periodically check token flows for alerted tokens with open positions.
+
+        Uses Arkham /token/top_flow (heavy endpoint, 1 req/sec) to detect:
+        - Dump warnings: large outflows from known whales/funds
+        - Accumulation signals: sustained inflows from smart money
+
+        Default: every 300s (5 min), configurable via arkham.flow_poll_interval_seconds.
+        """
+        if not self._flow_monitor:
+            return
+
+        interval = self.cfg.arkham.flow_poll_interval_seconds
+        # Initial delay to let eval pipeline generate some alerts first
+        await asyncio.sleep(120)
+
+        while not self._shutdown.is_set():
+            try:
+                events = await self._flow_monitor.check_flows(max_tokens=5)
+                for event in events:
+                    await self._notifier.notify_flow_alert(event)
+                if events:
+                    logger.info(
+                        "token_flow.events",
+                        count=len(events),
+                        types=[e.get("type") for e in events],
+                    )
+                self._backoff["token_flow"] = 0
+            except Exception:
+                self._stats["errors"] += 1
+                self._backoff["token_flow"] = min(
+                    self._backoff["token_flow"] + 1, 10,
+                )
+                logger.exception(
+                    "token_flow.error",
+                    backoff=self._backoff["token_flow"],
+                )
+
+            wait = interval + self._backoff_delay("token_flow")
+            try:
+                await asyncio.wait_for(self._shutdown.wait(), timeout=wait)
+                break
+            except asyncio.TimeoutError:
+                pass
+
+    # ------------------------------------------------------------------
+    # Portfolio watch loop — monitor Tier 1 wallet holdings
+    # ------------------------------------------------------------------
+
+    async def _portfolio_watch_loop(self) -> None:
+        """Periodically check portfolios of top-tier tracked wallets.
+
+        Uses Arkham /balances/address to detect new Base token positions
+        taken by our highest-confidence wallets.
+
+        Default: every 600s (10 min), configurable via arkham.portfolio_poll_interval_seconds.
+        """
+        interval = self.cfg.arkham.portfolio_poll_interval_seconds
+        min_position = self.cfg.arkham.portfolio_min_position_usd
+        # Initial delay — wait for wallet sync
+        await asyncio.sleep(180)
+
+        # Track known positions to detect NEW entries only
+        _seen_positions: dict[str, set[str]] = {}  # wallet -> set of token addresses
+
+        while not self._shutdown.is_set():
+            try:
+                if self._wallet_tracker and self._wallet_tracker.tracked_wallets:
+                    # Check top 30 wallets per cycle (20 req/sec limit, 600s interval)
+                    top_wallets = list(self._wallet_tracker.tracked_wallets)[:30]
+                    for wallet_addr in top_wallets:
+                        portfolio = await self._arkham.fetch_wallet_portfolio(
+                            wallet_addr, chain="base",
+                        )
+                        if not portfolio:
+                            continue
+
+                        prev = _seen_positions.get(wallet_addr, set())
+                        current_tokens = set()
+
+                        for holding in portfolio:
+                            token_addr = (holding.get("token", {}).get("address") or "").lower()
+                            usd_val = holding.get("usdValue") or 0.0
+                            if not token_addr or usd_val < min_position:
+                                continue
+                            current_tokens.add(token_addr)
+
+                            # New position detected
+                            if token_addr not in prev:
+                                token_name = holding.get("token", {}).get("symbol") or "?"
+                                logger.info(
+                                    "portfolio_watch.new_position",
+                                    wallet=wallet_addr[:10],
+                                    token=token_name,
+                                    usd=round(usd_val, 2),
+                                )
+                                # Check if we already track this token
+                                async with self._session_factory() as session:
+                                    from sqlalchemy import select
+                                    stmt = (
+                                        select(Token)
+                                        .where(Token.contract_address == token_addr)
+                                        .limit(1)
+                                    )
+                                    existing = (await session.execute(stmt)).scalar_one_or_none()
+                                    if existing:
+                                        # Conviction — smart wallet holds our tracked token
+                                        conv = {
+                                            "wallet_address": wallet_addr,
+                                            "wallet_label": wallet_addr[:10],
+                                            "token_name": existing.name,
+                                            "token_symbol": existing.symbol,
+                                            "token_address": token_addr,
+                                            "usd_value": usd_val,
+                                            "conviction_type": "portfolio_hold",
+                                        }
+                                        await self._notifier.notify_conviction(conv)
+
+                        _seen_positions[wallet_addr] = current_tokens
+
+                self._backoff["portfolio_watch"] = 0
+            except Exception:
+                self._stats["errors"] += 1
+                self._backoff["portfolio_watch"] = min(
+                    self._backoff["portfolio_watch"] + 1, 10,
+                )
+                logger.exception(
+                    "portfolio_watch.error",
+                    backoff=self._backoff["portfolio_watch"],
+                )
+
+            wait = interval + self._backoff_delay("portfolio_watch")
+            try:
+                await asyncio.wait_for(self._shutdown.wait(), timeout=wait)
+                break
+            except asyncio.TimeoutError:
+                pass
+
+    # ------------------------------------------------------------------
+    # Milestone tracker loop — ATH / multiplier notifications + dead cleanup
+    # ------------------------------------------------------------------
+
+    async def _milestone_tracker_loop(self) -> None:
+        """Scan all alerted, non-dead tokens for milestones every 5 min.
+
+        For each token with an AlertOutcome:
+        1. Fetch live DEX data (batch, 30 per call)
+        2. Compare current MCap with alert-time MCap/FDV
+        3. Detect:
+           - New ATH (all-time high MCap)
+           - New multiplier milestone (2x, 3x, 4x, ... of alert FDV)
+        4. Mark dead tokens (liq < $200 or mcap < $500 for 24h+)
+        5. Clean up: stop tracking tokens older than max_token_age_days
+        """
+        cfg = self.cfg.milestone_tracker
+        interval = cfg.scan_interval_seconds
+
+        # Initial delay — let eval pipeline generate some alerts first
+        await asyncio.sleep(120)
+
+        while not self._shutdown.is_set():
+            try:
+                async with self._session_factory() as session:
+                    from datetime import datetime, timezone, timedelta
+                    from sqlalchemy import select
+                    import math
+
+                    now = datetime.now(timezone.utc)
+                    max_age_cutoff = now - timedelta(days=cfg.max_token_age_days)
+
+                    # Fetch all alerted, non-dead tokens with outcomes
+                    stmt = (
+                        select(AlertOutcome, Token)
+                        .join(Token, Token.id == AlertOutcome.token_id)
+                        .where(Token.alert_sent.is_(True))
+                        .where(Token.is_dead.is_not(True))
+                        .where(AlertOutcome.alerted_at >= max_age_cutoff)
+                        .order_by(AlertOutcome.alerted_at.desc())
+                    )
+                    rows = (await session.execute(stmt)).all()
+
+                    if not rows:
+                        self._backoff["milestone_tracker"] = 0
+                        try:
+                            await asyncio.wait_for(
+                                self._shutdown.wait(), timeout=interval,
+                            )
+                            break
+                        except asyncio.TimeoutError:
+                            continue
+
+                    # Batch fetch DEX data (30 per call)
+                    all_tokens = [row[1] for row in rows]
+                    dex_map: dict[str, object] = {}
+                    for i in range(0, len(all_tokens), cfg.batch_size):
+                        batch = all_tokens[i:i + cfg.batch_size]
+                        batch_dex = await self._filter.fetch_dex_metrics_batch(batch)
+                        dex_map.update(batch_dex)
+                        # Respect DexScreener rate limits
+                        if i + cfg.batch_size < len(all_tokens):
+                            await asyncio.sleep(1.0)
+
+                    milestones_sent = 0
+                    dead_marked = 0
+
+                    for outcome, token in rows:
+                        if self._shutdown.is_set():
+                            break
+
+                        addr = token.contract_address.lower()
+                        m = dex_map.get(addr)
+
+                        current_mcap = m.market_cap_usd if m else None
+                        current_liq = m.liquidity_usd if m else None
+                        current_fdv = m.fdv_usd if m else None
+                        current_price = m.price_usd if m else None
+
+                        # ── Dead token detection ──
+                        if (
+                            current_mcap is not None
+                            and current_liq is not None
+                            and (current_liq < cfg.dead_liq_threshold_usd
+                                 or current_mcap < cfg.dead_mcap_threshold_usd)
+                        ):
+                            if token.dead_since is None:
+                                # First time below threshold — start countdown
+                                token.dead_since = now
+                            elif (now - token.dead_since).total_seconds() >= cfg.dead_confirmation_hours * 3600:
+                                # Confirmed dead
+                                token.is_dead = True
+                                dead_marked += 1
+                                alert_ref = outcome.alert_fdv or outcome.alert_mcap or 0
+                                days_since = (now - outcome.alerted_at).total_seconds() / 86400
+                                logger.info(
+                                    "milestone.dead",
+                                    token=token.symbol,
+                                    mcap=current_mcap,
+                                    liq=current_liq,
+                                    days=round(days_since, 1),
+                                )
+                                await self._notifier.notify_dead_token({
+                                    "token_name": token.name,
+                                    "token_symbol": token.symbol,
+                                    "token_address": token.contract_address,
+                                    "alert_mcap": alert_ref,
+                                    "current_mcap": current_mcap or 0,
+                                    "current_liq": current_liq or 0,
+                                    "days_since_alert": days_since,
+                                })
+                                continue
+                        else:
+                            # Token recovered — reset dead countdown
+                            if token.dead_since is not None:
+                                token.dead_since = None
+
+                        # ── No DEX data — skip milestones ──
+                        if current_mcap is None or current_mcap <= 0:
+                            continue
+
+                        # Reference value: prefer alert FDV, fallback to alert MCap
+                        alert_ref = outcome.alert_fdv or outcome.alert_mcap
+                        if not alert_ref or alert_ref <= 0:
+                            continue
+
+                        # ── ATH tracking ──
+                        prev_ath = outcome.ath_mcap or 0
+                        if current_mcap > prev_ath:
+                            outcome.ath_mcap = current_mcap
+
+                            # Notify ATH (with cooldown)
+                            if cfg.notify_ath and current_mcap > prev_ath * 1.1:
+                                # Only notify if >10% above previous ATH (avoid spam)
+                                last_notified = outcome.milestone_notified_at
+                                cooldown_ok = (
+                                    last_notified is None
+                                    or (now - last_notified).total_seconds() >= cfg.ath_cooldown_seconds
+                                )
+                                if cooldown_ok and prev_ath > 0:
+                                    pnl_pct = ((current_mcap / alert_ref) - 1) * 100
+                                    await self._notifier.notify_milestone({
+                                        "event_type": "ath",
+                                        "token_name": token.name,
+                                        "token_symbol": token.symbol,
+                                        "token_address": token.contract_address,
+                                        "alert_mcap": outcome.alert_mcap,
+                                        "alert_fdv": outcome.alert_fdv,
+                                        "current_mcap": current_mcap,
+                                        "current_fdv": current_fdv,
+                                        "current_liq": current_liq,
+                                        "current_price": current_price,
+                                        "ath_mcap": current_mcap,
+                                        "multiplier": int(current_mcap / alert_ref),
+                                        "pnl_pct": pnl_pct,
+                                    })
+                                    outcome.milestone_notified_at = now
+                                    milestones_sent += 1
+
+                        # ── Multiplier milestone tracking ──
+                        if cfg.notify_multiplier:
+                            current_x = int(current_mcap / alert_ref)
+                            prev_x = outcome.last_milestone_x or 0
+
+                            if current_x >= cfg.min_multiplier_notify and current_x > prev_x:
+                                pnl_pct = ((current_mcap / alert_ref) - 1) * 100
+                                await self._notifier.notify_milestone({
+                                    "event_type": "multiplier",
+                                    "token_name": token.name,
+                                    "token_symbol": token.symbol,
+                                    "token_address": token.contract_address,
+                                    "alert_mcap": outcome.alert_mcap,
+                                    "alert_fdv": outcome.alert_fdv,
+                                    "current_mcap": current_mcap,
+                                    "current_fdv": current_fdv,
+                                    "current_liq": current_liq,
+                                    "current_price": current_price,
+                                    "ath_mcap": outcome.ath_mcap,
+                                    "multiplier": current_x,
+                                    "pnl_pct": pnl_pct,
+                                })
+                                outcome.last_milestone_x = current_x
+                                outcome.milestone_notified_at = now
+                                milestones_sent += 1
+                                logger.info(
+                                    "milestone.multiplier",
+                                    token=token.symbol,
+                                    x=current_x,
+                                    mcap=current_mcap,
+                                    alert_ref=alert_ref,
+                                )
+
+                    await session.commit()
+
+                    if milestones_sent > 0 or dead_marked > 0:
+                        logger.info(
+                            "milestone_tracker.cycle",
+                            tokens_checked=len(rows),
+                            milestones=milestones_sent,
+                            dead=dead_marked,
+                        )
+
+                self._backoff["milestone_tracker"] = 0
+            except Exception:
+                self._stats["errors"] += 1
+                self._backoff["milestone_tracker"] = min(
+                    self._backoff["milestone_tracker"] + 1, 10,
+                )
+                logger.exception(
+                    "milestone_tracker.error",
+                    backoff=self._backoff["milestone_tracker"],
+                )
+
+            wait = interval + self._backoff_delay("milestone_tracker")
+            try:
+                await asyncio.wait_for(self._shutdown.wait(), timeout=wait)
+                break
+            except asyncio.TimeoutError:
+                pass
+
+    # ------------------------------------------------------------------
+    # Gate-pending re-scan — catch tokens that grow past MCap/Liq gates
+    # ------------------------------------------------------------------
+
+    async def _gate_pending_loop(self) -> None:
+        """Re-check tokens that passed scoring but failed hard MCap/Liq gates.
+
+        Tokens with gate_pending=True are re-checked every N minutes.
+        If MCap/Liq now exceeds the gate → send the alert.
+        After max_rechecks attempts → give up.
+        """
+        cfg = self.cfg.gate_pending
+        interval = cfg.recheck_interval_seconds
+
+        await asyncio.sleep(30)  # Let eval pipeline run first
+
+        while not self._shutdown.is_set():
+            try:
+                async with self._session_factory() as session:
+                    from datetime import datetime, timezone, timedelta
+                    from sqlalchemy import select
+
+                    now = datetime.now(timezone.utc)
+
+                    # Fetch gate-pending tokens, oldest first
+                    stmt = (
+                        select(Token)
+                        .where(Token.gate_pending.is_(True))
+                        .where(Token.alert_sent.is_(False))
+                        .where(Token.gate_check_count < cfg.max_rechecks)
+                        .order_by(Token.discovered_at.asc())
+                        .limit(cfg.batch_size)
+                    )
+                    tokens = list((await session.execute(stmt)).scalars().all())
+
+                    if not tokens:
+                        try:
+                            await asyncio.wait_for(
+                                self._shutdown.wait(), timeout=interval,
+                            )
+                            break
+                        except asyncio.TimeoutError:
+                            continue
+
+                    # Batch fetch DEX data
+                    dex_map = await self._filter.fetch_dex_metrics_batch(tokens)
+
+                    min_mcap = self.cfg.filtering.min_alert_mcap_usd
+                    min_liq = self.cfg.filtering.min_alert_liquidity_usd
+                    alerts_sent = 0
+                    gave_up = 0
+
+                    for token in tokens:
+                        if self._shutdown.is_set():
+                            break
+
+                        addr = token.contract_address.lower()
+                        m = dex_map.get(addr)
+                        token.gate_check_count += 1
+                        token.last_gate_check = now
+
+                        if not m:
+                            # No DEX data — skip
+                            if token.gate_check_count >= cfg.max_rechecks:
+                                token.gate_pending = False
+                                gave_up += 1
+                            continue
+
+                        current_mcap = m.market_cap_usd or 0
+                        current_liq = m.liquidity_usd or 0
+
+                        # Check if gates are now passed
+                        mcap_ok = current_mcap >= min_mcap
+                        liq_ok = current_liq >= min_liq
+
+                        if mcap_ok and liq_ok:
+                            # Gates passed! Send the alert
+                            token.gate_pending = False
+                            token.rejection_reason = None
+
+                            # Resolve context
+                            ctx = await self._resolver.resolve(token, session)
+
+                            # Re-score to get fresh FilterResult for notification
+                            filt_result = await self._filter.evaluate(
+                                token, session,
+                            )
+                            # Override rejection — we're forcing this through
+                            filt_result.rejected = False
+                            filt_result.rejection_reason = ""
+                            # Use fresh metrics
+                            filt_result.metrics = m
+
+                            # Duplicate contract check
+                            cooldown = self.cfg.filtering.duplicate_symbol_cooldown_seconds
+                            if cooldown > 0 and token.symbol:
+                                dup_cutoff = now - timedelta(seconds=cooldown)
+                                dup_stmt = (
+                                    select(Token.id, Token.contract_address)
+                                    .where(Token.symbol == token.symbol)
+                                    .where(Token.alert_sent.is_(True))
+                                    .where(Token.updated_at >= dup_cutoff)
+                                    .where(Token.id != token.id)
+                                    .limit(1)
+                                )
+                                dup_row = (await session.execute(dup_stmt)).first()
+                                if dup_row and dup_row[1] and dup_row[1].lower() == addr:
+                                    token.rejection_reason = f"Duplicate contract ${token.symbol}"
+                                    continue
+
+                            # Query Nansen buys
+                            nansen_buys = await self._query_nansen_buys(
+                                session, token.contract_address,
+                            )
+
+                            sent = await self._notifier.notify(
+                                token, ctx, filt_result,
+                                nansen_buys=nansen_buys or None,
+                            )
+                            if sent:
+                                token.alert_sent = True
+                                self._stats["alerts_sent"] += 1
+                                alerts_sent += 1
+                                logger.info(
+                                    "gate_pending.alert_sent",
+                                    token=token.symbol,
+                                    score=round(filt_result.final_score, 3),
+                                    mcap=current_mcap,
+                                    liq=current_liq,
+                                    rechecks=token.gate_check_count,
+                                )
+
+                                # Record alert outcome
+                                outcome = AlertOutcome(
+                                    token_id=token.id,
+                                    alert_score=filt_result.final_score,
+                                    alert_mcap=m.market_cap_usd,
+                                    alert_fdv=m.fdv_usd,
+                                    alert_liq=m.liquidity_usd,
+                                    alert_vol_1h=m.volume_1h_usd,
+                                    alert_buys_1h=m.buys_1h,
+                                )
+                                session.add(outcome)
+
+                                # Auto paper trading
+                                if self.cfg.paper_trading.enabled:
+                                    await self._open_paper_position(
+                                        session, token, m,
+                                    )
+                        else:
+                            # Still below gate
+                            if token.gate_check_count >= cfg.max_rechecks:
+                                token.gate_pending = False
+                                gave_up += 1
+                                logger.info(
+                                    "gate_pending.gave_up",
+                                    token=token.symbol,
+                                    mcap=current_mcap,
+                                    liq=current_liq,
+                                    rechecks=token.gate_check_count,
+                                )
+
+                    await session.commit()
+
+                    if alerts_sent > 0 or gave_up > 0:
+                        logger.info(
+                            "gate_pending.cycle",
+                            pending=len(tokens),
+                            alerts=alerts_sent,
+                            gave_up=gave_up,
+                        )
+
+                self._backoff["gate_pending"] = 0
+            except Exception:
+                self._stats["errors"] += 1
+                self._backoff["gate_pending"] = min(
+                    self._backoff["gate_pending"] + 1, 10,
+                )
+                logger.exception(
+                    "gate_pending.error",
+                    backoff=self._backoff["gate_pending"],
+                )
+
+            wait = interval + self._backoff_delay("gate_pending")
             try:
                 await asyncio.wait_for(self._shutdown.wait(), timeout=wait)
                 break
@@ -558,6 +1209,10 @@ class Tracker:
                                     f"MCap ${alert_mcap:,.0f} below "
                                     f"${min_mcap:,.0f} gate"
                                 )
+                                # Mark for gate-pending re-scan
+                                if self.cfg.gate_pending.enabled:
+                                    token.gate_pending = True
+                                    token.gate_check_count = 0
                                 continue
 
                             # Hard liquidity gate
@@ -574,34 +1229,53 @@ class Tracker:
                                     f"Liq ${alert_liq:,.0f} below "
                                     f"${min_liq:,.0f} gate"
                                 )
+                                # Mark for gate-pending re-scan
+                                if self.cfg.gate_pending.enabled:
+                                    token.gate_pending = True
+                                    token.gate_check_count = 0
                                 continue
 
-                            # Duplicate symbol cooldown
+                            # Duplicate symbol cooldown — contract-address aware
+                            # Only block if the SAME contract was already alerted,
+                            # or a truly different token with matching symbol
+                            # was alerted within the cooldown window AND has
+                            # the same deployer (likely impersonation).
                             cooldown = self.cfg.filtering.duplicate_symbol_cooldown_seconds
                             if cooldown > 0 and token.symbol:
                                 dup_cutoff = datetime.now(timezone.utc) - timedelta(
                                     seconds=cooldown,
                                 )
                                 dup_stmt = (
-                                    select(Token.id)
+                                    select(Token.id, Token.contract_address)
                                     .where(Token.symbol == token.symbol)
                                     .where(Token.alert_sent.is_(True))
                                     .where(Token.updated_at >= dup_cutoff)
                                     .where(Token.id != token.id)
                                     .limit(1)
                                 )
-                                dup = (await session.execute(dup_stmt)).scalar_one_or_none()
-                                if dup is not None:
-                                    logger.info(
-                                        "alert.blocked.duplicate_symbol",
-                                        token=token.symbol,
-                                        existing_id=dup,
-                                    )
-                                    token.rejection_reason = (
-                                        f"Duplicate symbol ${token.symbol} "
-                                        f"(cooldown {cooldown}s)"
-                                    )
-                                    continue
+                                dup_row = (await session.execute(dup_stmt)).first()
+                                if dup_row is not None:
+                                    dup_id, dup_addr = dup_row
+                                    # Skip only if same contract (true
+                                    # duplicate) — different contracts with
+                                    # same symbol are different projects
+                                    if dup_addr and dup_addr.lower() == token.contract_address.lower():
+                                        logger.info(
+                                            "alert.blocked.duplicate_contract",
+                                            token=token.symbol,
+                                            existing_id=dup_id,
+                                        )
+                                        token.rejection_reason = (
+                                            f"Duplicate contract ${token.symbol}"
+                                        )
+                                        continue
+                                    else:
+                                        logger.info(
+                                            "alert.same_symbol_different_contract",
+                                            token=token.symbol,
+                                            existing_id=dup_id,
+                                            note="Allowing — different contract",
+                                        )
 
                             # Query Nansen wallet buys for this token
                             nansen_buys = await self._query_nansen_buys(

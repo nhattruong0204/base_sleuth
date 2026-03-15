@@ -1,13 +1,17 @@
-"""Arkham Intel API client for smart wallet tracking.
+"""Arkham Intel API client for smart wallet tracking and on-chain intelligence.
 
 Integrates with Arkham Intel to:
 1. Fetch Base EVM wallets tagged 'fomo-user'
 2. Analyze wallet performance (PnL via historical USD flows)
 3. Monitor wallet swaps for buy signals
 4. Detect conviction signals (tracked wallet buys token in our DB)
+5. Token Holder Intelligence — identify WHO holds a token (funds, VCs, whales)
+6. Deployer Profiling — identify WHO deployed a token contract (scammer? builder?)
+7. Token Flow Intelligence — monitor inflows/outflows for dump detection
+8. Portfolio Watch — detect new positions from smart wallets
 
-API docs: https://docs.intel.arkm.com/openapi
-Rate limits: 20 req/sec standard, 1 req/sec for heavy endpoints (/swaps, /transfers)
+API docs: https://intel.arkm.com/api/docs
+Rate limits: 20 req/sec standard, 1 req/sec for heavy endpoints (/swaps, /transfers, /token/top_flow)
 """
 
 from __future__ import annotations
@@ -388,6 +392,661 @@ class ArkhamClient:
             return 0
         except Exception:
             return 0
+
+    # ------------------------------------------------------------------
+    # Token Holder Intelligence (THI) — identify WHO holds a token
+    # ------------------------------------------------------------------
+
+    async def fetch_token_top_holders(
+        self,
+        token_address: str,
+        chain: str = "base",
+    ) -> list[dict]:
+        """Fetch top holders for a token on the specified chain.
+
+        Uses GET /token/holders/{chain}/{address} with groupByEntity.
+        Returns list of dicts with keys: address, balance_usd, share_pct, entity.
+        """
+        if not self.enabled:
+            return []
+
+        try:
+            resp = await self._http.get(
+                f"{self.cfg.base_url}/token/holders/{chain}/{token_address}",
+                headers=self._headers,
+                params={"groupByEntity": "true"},
+                timeout=15,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+
+            holders: list[dict] = []
+            # Response has holders nested by chain
+            holders_data = data.get("holders") or {}
+
+            # Flatten all chain holders
+            for chain_key, chain_holders in holders_data.items():
+                if not isinstance(chain_holders, list):
+                    continue
+                for h in chain_holders:
+                    addr_obj = h.get("address", {})
+                    addr = (addr_obj.get("address", "") if isinstance(addr_obj, dict) else "").lower()
+                    entity = addr_obj.get("arkhamEntity", {}) if isinstance(addr_obj, dict) else {}
+                    entity_name = entity.get("name") if isinstance(entity, dict) else None
+                    entity_type = entity.get("type") if isinstance(entity, dict) else None
+
+                    holders.append({
+                        "address": addr,
+                        "balance_usd": h.get("balanceUSD") or 0,
+                        "share_pct": h.get("share") or 0,
+                        "entity_name": entity_name,
+                        "entity_type": entity_type,
+                        "label": addr_obj.get("arkhamLabel") if isinstance(addr_obj, dict) else None,
+                        "tags": addr_obj.get("tags", []) if isinstance(addr_obj, dict) else [],
+                    })
+
+            # Sort by share descending
+            holders.sort(key=lambda x: x.get("share_pct", 0), reverse=True)
+            return holders
+
+        except httpx.HTTPStatusError as exc:
+            logger.debug(
+                "arkham.token_holders.http_error",
+                token=token_address[:12],
+                status=exc.response.status_code,
+            )
+            return []
+        except Exception:
+            logger.debug("arkham.token_holders.error", token=token_address[:12])
+            return []
+
+    async def batch_identify_addresses(
+        self,
+        addresses: list[str],
+        chain: str = "base",
+    ) -> dict[str, dict]:
+        """Batch identify up to 1000 addresses via Arkham enriched intelligence.
+
+        Uses POST /intelligence/address_enriched/batch with chain filter.
+        Returns dict of address -> intelligence data.
+        """
+        if not self.enabled or not addresses:
+            return {}
+
+        result: dict[str, dict] = {}
+
+        # Process in batches of 1000 (API limit)
+        for i in range(0, len(addresses), 1000):
+            batch = addresses[i : i + 1000]
+            try:
+                resp = await self._http.post(
+                    f"{self.cfg.base_url}/intelligence/address_enriched/batch",
+                    headers={**self._headers, "Content-Type": "application/json"},
+                    json={"addresses": batch},
+                    params={
+                        "chain": chain,
+                        "includeTags": "true",
+                        "includeClusters": "false",
+                        "includeEntityPredictions": "false",
+                    },
+                    timeout=30,
+                )
+                resp.raise_for_status()
+                data = resp.json()
+
+                for addr_data in data if isinstance(data, list) else data.get("addresses", []):
+                    addr = (addr_data.get("address") or "").lower()
+                    if not addr:
+                        continue
+                    entity = addr_data.get("arkhamEntity", {})
+                    result[addr] = {
+                        "address": addr,
+                        "entity_name": entity.get("name") if isinstance(entity, dict) else None,
+                        "entity_type": entity.get("type") if isinstance(entity, dict) else None,
+                        "label": addr_data.get("arkhamLabel"),
+                        "is_contract": addr_data.get("isContract", False),
+                        "tags": [
+                            t.get("id") or t.get("name", "")
+                            for t in (addr_data.get("tags") or [])
+                            if isinstance(t, dict)
+                        ],
+                        "balance_usd": addr_data.get("balanceUSD"),
+                    }
+
+            except httpx.HTTPStatusError as exc:
+                logger.debug(
+                    "arkham.batch_identify.http_error",
+                    batch_size=len(batch),
+                    status=exc.response.status_code,
+                )
+            except Exception:
+                logger.debug("arkham.batch_identify.error", batch_size=len(batch))
+
+            if i + 1000 < len(addresses):
+                await asyncio.sleep(0.1)  # Rate limit between batches
+
+        return result
+
+    async def fetch_contract_intel(
+        self,
+        token_address: str,
+        chain: str = "base",
+    ) -> Optional[dict]:
+        """Get deployer info and contract metadata.
+
+        Uses GET /intelligence/contract/{chain}/{address}.
+        Returns dict with deployer address, proxy status, block info.
+        """
+        if not self.enabled:
+            return None
+
+        try:
+            resp = await self._http.get(
+                f"{self.cfg.base_url}/intelligence/contract/{chain}/{token_address}",
+                headers=self._headers,
+                timeout=15,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+
+            deployer = data.get("deployer", {})
+            deployer_addr = (deployer.get("address") or "").lower() if isinstance(deployer, dict) else ""
+
+            return {
+                "deployer_address": deployer_addr,
+                "deployer_entity": deployer.get("arkhamEntity", {}) if isinstance(deployer, dict) else {},
+                "deployer_label": deployer.get("arkhamLabel") if isinstance(deployer, dict) else None,
+                "is_proxy": data.get("isProxy", False),
+                "block_number": data.get("blockNumber"),
+                "block_timestamp": data.get("blockTimestamp"),
+            }
+
+        except httpx.HTTPStatusError as exc:
+            logger.debug(
+                "arkham.contract_intel.http_error",
+                token=token_address[:12],
+                status=exc.response.status_code,
+            )
+            return None
+        except Exception:
+            logger.debug("arkham.contract_intel.error", token=token_address[:12])
+            return None
+
+    async def fetch_token_flows(
+        self,
+        token_address: str,
+        chain: str = "base",
+        time_last: str = "24h",
+    ) -> Optional[dict]:
+        """Get top inflows/outflows for a token.
+
+        Uses GET /token/top_flow/{chain}/{address} (heavy: 1 req/sec).
+        Returns dict with top_inflows and top_outflows.
+        """
+        if not self.enabled:
+            return None
+
+        try:
+            resp = await self._http.get(
+                f"{self.cfg.base_url}/token/top_flow/{chain}/{token_address}",
+                headers=self._headers,
+                params={"timeLast": time_last},
+                timeout=20,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+
+            def _parse_flows(flow_list: list) -> list[dict]:
+                parsed = []
+                for f in (flow_list or []):
+                    addr_obj = f.get("address", {})
+                    addr = (addr_obj.get("address", "") if isinstance(addr_obj, dict) else "").lower()
+                    entity = addr_obj.get("arkhamEntity", {}) if isinstance(addr_obj, dict) else {}
+                    parsed.append({
+                        "address": addr,
+                        "usd_value": f.get("usd") or 0,
+                        "token_value": f.get("value") or 0,
+                        "entity_name": entity.get("name") if isinstance(entity, dict) else None,
+                        "entity_type": entity.get("type") if isinstance(entity, dict) else None,
+                        "label": addr_obj.get("arkhamLabel") if isinstance(addr_obj, dict) else None,
+                    })
+                return parsed
+
+            return {
+                "top_inflows": _parse_flows(data.get("inflows") or data.get("topInflows") or []),
+                "top_outflows": _parse_flows(data.get("outflows") or data.get("topOutflows") or []),
+            }
+
+        except httpx.HTTPStatusError as exc:
+            logger.debug(
+                "arkham.token_flows.http_error",
+                token=token_address[:12],
+                status=exc.response.status_code,
+            )
+            return None
+        except Exception:
+            logger.debug("arkham.token_flows.error", token=token_address[:12])
+            return None
+
+    async def fetch_wallet_portfolio(
+        self,
+        address: str,
+        chain: str = "base",
+    ) -> list[dict]:
+        """Get token balances for a wallet on a specific chain.
+
+        Uses GET /balances/address/{address}?chains={chain}.
+        Returns list of token holding dicts.
+        """
+        if not self.enabled:
+            return []
+
+        try:
+            resp = await self._http.get(
+                f"{self.cfg.base_url}/balances/address/{address}",
+                headers=self._headers,
+                params={"chains": chain},
+                timeout=15,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+
+            holdings: list[dict] = []
+            # Response is typically a dict of chain -> token balances
+            for chain_data in (data.get("chains") or data if isinstance(data, dict) else [data]):
+                tokens_list = []
+                if isinstance(chain_data, dict):
+                    tokens_list = chain_data.get("tokens") or chain_data.get("balances") or []
+                elif isinstance(chain_data, list):
+                    tokens_list = chain_data
+
+                for tok in tokens_list:
+                    if isinstance(tok, dict):
+                        holdings.append({
+                            "token_address": (tok.get("token", {}).get("address") or tok.get("address") or "").lower(),
+                            "token_symbol": tok.get("token", {}).get("symbol") or tok.get("symbol") or "",
+                            "token_name": tok.get("token", {}).get("name") or tok.get("name") or "",
+                            "balance_usd": tok.get("balanceUSD") or tok.get("usd") or 0,
+                            "quantity": tok.get("quantity") or tok.get("balance") or 0,
+                        })
+
+            # Sort by USD balance descending
+            holdings.sort(key=lambda x: x.get("balance_usd", 0), reverse=True)
+            return holdings
+
+        except httpx.HTTPStatusError as exc:
+            logger.debug(
+                "arkham.portfolio.http_error",
+                address=address[:10],
+                status=exc.response.status_code,
+            )
+            return []
+        except Exception:
+            logger.debug("arkham.portfolio.error", address=address[:10])
+            return []
+
+    # ------------------------------------------------------------------
+    # Composite intelligence methods — high-level trader-grade analysis
+    # ------------------------------------------------------------------
+
+    async def analyze_holder_quality(self, token_address: str) -> dict:
+        """Composite analysis: fetch holders → identify → score quality.
+
+        Returns a dict with:
+        - holder_score: 0.0-1.0 quality score
+        - known_entities: count of Arkham-labeled holders
+        - fund_vc_count: count of fund/VC entities holding
+        - whale_count: count of large wallets (>$50K in token)
+        - concentration_top10: % of supply in top 10 holders
+        - exchange_holders: count of exchange-linked addresses
+        - risk_flags: list of risk indicators
+        - smart_wallet_holders: count of our tracked wallets holding
+        """
+        result = {
+            "holder_score": 0.0,
+            "known_entities": 0,
+            "fund_vc_count": 0,
+            "whale_count": 0,
+            "concentration_top10": 0.0,
+            "exchange_holders": 0,
+            "risk_flags": [],
+            "smart_wallet_holders": 0,
+            "total_holders_analyzed": 0,
+        }
+
+        if not self.enabled:
+            return result
+
+        # Step 1: Get top holders
+        holders = await self.fetch_token_top_holders(token_address)
+        if not holders:
+            return result
+
+        result["total_holders_analyzed"] = len(holders)
+
+        # Step 2: Calculate concentration risk (top 10)
+        top_10_share = sum(h.get("share_pct", 0) for h in holders[:10])
+        result["concentration_top10"] = round(top_10_share * 100 if top_10_share < 1 else top_10_share, 2)
+
+        # Step 3: Batch identify unknown holders
+        unknown_addrs = [
+            h["address"]
+            for h in holders
+            if h["address"] and not h.get("entity_name") and h["address"].startswith("0x")
+        ]
+        if unknown_addrs:
+            intel = await self.batch_identify_addresses(unknown_addrs[:100])
+            # Merge intel back into holders
+            for h in holders:
+                if h["address"] in intel:
+                    info = intel[h["address"]]
+                    h["entity_name"] = h.get("entity_name") or info.get("entity_name")
+                    h["entity_type"] = h.get("entity_type") or info.get("entity_type")
+                    h["label"] = h.get("label") or info.get("label")
+                    h["tags"] = h.get("tags") or info.get("tags", [])
+
+        # Step 4: Classify holders
+        fund_vc_types = {"fund", "vc", "venture_capital", "hedge_fund", "investment"}
+        exchange_types = {"exchange", "cex", "dex"}
+
+        score = 0.0
+        for h in holders:
+            entity_type = (h.get("entity_type") or "").lower()
+            entity_name = h.get("entity_name") or ""
+            label = h.get("label") or ""
+            tags = h.get("tags") or []
+            balance = h.get("balance_usd") or 0
+
+            # Known entity (has a name/label in Arkham)
+            if entity_name or label:
+                result["known_entities"] += 1
+                score += 0.02  # Each known entity adds a small bonus
+
+            # Fund / VC holding
+            if entity_type in fund_vc_types or any(
+                t in entity_type for t in ("fund", "capital", "ventures")
+            ):
+                result["fund_vc_count"] += 1
+                score += 0.10  # Strong signal
+
+            # Exchange holding
+            if entity_type in exchange_types:
+                result["exchange_holders"] += 1
+
+            # Whale detection (>$50K position)
+            if balance > 50_000:
+                result["whale_count"] += 1
+                if entity_name:  # Known whale is good
+                    score += 0.05
+                else:  # Unknown whale is neutral-positive
+                    score += 0.02
+
+            # Tag-based signals
+            tag_set = {t.lower() if isinstance(t, str) else "" for t in tags}
+            if "smart-money" in tag_set or "early-token-holder" in tag_set:
+                result["smart_wallet_holders"] += 1
+                score += 0.05
+
+            # Risk: known scammer tags
+            scam_tags = {"scam", "hack", "exploit", "phishing", "rugpull"}
+            if tag_set & scam_tags:
+                result["risk_flags"].append(f"Holder has scam tag: {tag_set & scam_tags}")
+                score -= 0.20
+
+        # Risk flags
+        if result["concentration_top10"] > 80:
+            result["risk_flags"].append(f"High concentration: top 10 hold {result['concentration_top10']:.0f}%")
+            score -= 0.10
+        elif result["concentration_top10"] > 60:
+            result["risk_flags"].append(f"Moderate concentration: top 10 hold {result['concentration_top10']:.0f}%")
+            score -= 0.05
+
+        if result["exchange_holders"] >= 3:
+            result["risk_flags"].append(f"{result['exchange_holders']} exchange addresses holding")
+            score -= 0.05  # Multiple exchange wallets = potential dump vectors
+
+        result["holder_score"] = round(max(min(score, 1.0), 0.0), 4)
+
+        logger.info(
+            "arkham.holder_quality",
+            token=token_address[:12],
+            score=result["holder_score"],
+            known=result["known_entities"],
+            funds=result["fund_vc_count"],
+            whales=result["whale_count"],
+            concentration=result["concentration_top10"],
+        )
+        return result
+
+    async def profile_deployer(self, token_address: str) -> dict:
+        """Composite analysis: fetch contract → identify deployer → risk assessment.
+
+        Returns a dict with:
+        - deployer_address: the deployer wallet
+        - deployer_name: Arkham entity name (if known)
+        - deployer_type: entity type (fund, exchange, etc.)
+        - deployer_tags: list of tags on the deployer address
+        - deployer_score: -1.0 to 1.0 (negative=bad, positive=good)
+        - risk_level: 'safe' | 'unknown' | 'risky' | 'dangerous'
+        - is_serial_deployer: bool (has deployed many contracts)
+        """
+        result = {
+            "deployer_address": "",
+            "deployer_name": None,
+            "deployer_type": None,
+            "deployer_tags": [],
+            "deployer_score": 0.0,
+            "risk_level": "unknown",
+            "is_serial_deployer": False,
+            "is_proxy": False,
+        }
+
+        if not self.enabled:
+            return result
+
+        # Step 1: Get contract intelligence
+        contract = await self.fetch_contract_intel(token_address)
+        if not contract:
+            return result
+
+        deployer_addr = contract.get("deployer_address", "")
+        result["deployer_address"] = deployer_addr
+        result["is_proxy"] = contract.get("is_proxy", False)
+
+        if not deployer_addr:
+            return result
+
+        # Step 2: Identify deployer via enriched intelligence
+        deployer_entity = contract.get("deployer_entity", {})
+        deployer_name = deployer_entity.get("name") if isinstance(deployer_entity, dict) else None
+        deployer_type = deployer_entity.get("type") if isinstance(deployer_entity, dict) else None
+        deployer_label = contract.get("deployer_label")
+
+        # If no entity info from contract, try direct lookup
+        if not deployer_name:
+            intel = await self.batch_identify_addresses([deployer_addr])
+            if deployer_addr in intel:
+                info = intel[deployer_addr]
+                deployer_name = info.get("entity_name")
+                deployer_type = info.get("entity_type")
+                deployer_label = deployer_label or info.get("label")
+                result["deployer_tags"] = info.get("tags", [])
+
+        result["deployer_name"] = deployer_name or deployer_label
+        result["deployer_type"] = deployer_type
+
+        # Step 3: Risk assessment
+        score = 0.0
+        tags = {t.lower() if isinstance(t, str) else "" for t in result["deployer_tags"]}
+
+        # Known builder / reputable entity → bonus
+        if deployer_name:
+            score += 0.10
+            if deployer_type in ("fund", "vc", "protocol", "dapp"):
+                score += 0.15
+                result["risk_level"] = "safe"
+            elif deployer_type in ("exchange", "cex"):
+                score += 0.05
+                result["risk_level"] = "safe"
+
+        # Known bad tags → penalty
+        bad_tags = {"scam", "hack", "exploit", "phishing", "rugpull", "sanctioned",
+                    "ofac-sanctioned", "theft"}
+        if tags & bad_tags:
+            score = -1.0
+            result["risk_level"] = "dangerous"
+
+        # Contract deployer tag → could be serial deployer
+        if "contract-deployer" in tags:
+            result["is_serial_deployer"] = True
+            # Not inherently bad, but a flag
+            score -= 0.05
+
+        # Proxy contracts are a yellow flag (can be upgraded = rug vector)
+        if result["is_proxy"]:
+            score -= 0.10
+            if result["risk_level"] == "unknown":
+                result["risk_level"] = "risky"
+
+        if result["risk_level"] == "unknown":
+            if score > 0:
+                result["risk_level"] = "safe"
+            elif score < -0.10:
+                result["risk_level"] = "risky"
+
+        result["deployer_score"] = round(max(min(score, 1.0), -1.0), 4)
+
+        logger.info(
+            "arkham.deployer_profile",
+            token=token_address[:12],
+            deployer=deployer_addr[:12],
+            name=deployer_name,
+            risk=result["risk_level"],
+            score=result["deployer_score"],
+        )
+        return result
+
+
+class TokenFlowMonitor:
+    """Monitors token flows for smart money dump/accumulation detection.
+
+    Periodically checks /token/top_flow for alerted tokens to detect:
+    - Smart money dumping (known wallets selling) → warning alert
+    - Smart money accumulating (known wallets buying) → bullish signal
+    - Whale concentration changes → risk assessment update
+    """
+
+    def __init__(
+        self,
+        config: AppConfig,
+        arkham: ArkhamClient,
+        session_factory,
+    ) -> None:
+        self.cfg = config.arkham
+        self._arkham = arkham
+        self._session_factory = session_factory
+        self._last_check: dict[str, datetime] = {}  # token_addr -> last check time
+
+    async def check_flows(self, max_tokens: int = 10) -> list[dict]:
+        """Check token flows for recently alerted tokens.
+
+        Returns list of significant flow events for alerting.
+        Each event dict has: token, direction, usd_total, top_movers, signal_type.
+        """
+        if not self._arkham.enabled:
+            return []
+
+        events: list[dict] = []
+        now = datetime.now(timezone.utc)
+        check_interval = timedelta(seconds=self.cfg.flow_poll_interval_seconds)
+
+        async with self._session_factory() as session:
+            # Get recently alerted tokens with open paper positions
+            from sqlalchemy import select as sa_select, or_
+            from .models import PaperPosition
+
+            stmt = (
+                sa_select(Token)
+                .join(PaperPosition, PaperPosition.token_id == Token.id)
+                .where(Token.alert_sent.is_(True))
+                .where(PaperPosition.status.in_(["open", "tp1", "tp2"]))
+                .order_by(Token.updated_at.desc())
+                .limit(max_tokens)
+            )
+            tokens = list((await session.execute(stmt)).scalars().all())
+
+            if not tokens:
+                return []
+
+            for token in tokens:
+                addr = token.contract_address.lower()
+
+                # Respect check interval per token
+                last = self._last_check.get(addr)
+                if last and (now - last) < check_interval:
+                    continue
+
+                self._last_check[addr] = now
+
+                # Fetch token flows
+                flows = await self._arkham.fetch_token_flows(addr, time_last="24h")
+                if not flows:
+                    continue
+
+                inflows = flows.get("top_inflows", [])
+                outflows = flows.get("top_outflows", [])
+
+                # Analyze for significant events
+                total_inflow = sum(f.get("usd_value", 0) for f in inflows)
+                total_outflow = sum(f.get("usd_value", 0) for f in outflows)
+
+                # Significant outflow from known entities = dump warning
+                known_outflows = [
+                    f for f in outflows
+                    if f.get("entity_name") and f.get("usd_value", 0) >= self.cfg.flow_min_usd
+                ]
+                if known_outflows:
+                    total_known_out = sum(f["usd_value"] for f in known_outflows)
+                    if total_known_out >= self.cfg.flow_alert_threshold_usd:
+                        events.append({
+                            "token": token,
+                            "direction": "outflow",
+                            "signal_type": "dump_warning",
+                            "usd_total": total_known_out,
+                            "top_movers": known_outflows[:5],
+                            "total_inflow": total_inflow,
+                            "total_outflow": total_outflow,
+                        })
+
+                # Significant inflow from known entities = accumulation signal
+                known_inflows = [
+                    f for f in inflows
+                    if f.get("entity_name") and f.get("usd_value", 0) >= self.cfg.flow_min_usd
+                ]
+                if known_inflows:
+                    total_known_in = sum(f["usd_value"] for f in known_inflows)
+                    if total_known_in >= self.cfg.flow_alert_threshold_usd:
+                        events.append({
+                            "token": token,
+                            "direction": "inflow",
+                            "signal_type": "accumulation",
+                            "usd_total": total_known_in,
+                            "top_movers": known_inflows[:5],
+                            "total_inflow": total_inflow,
+                            "total_outflow": total_outflow,
+                        })
+
+                # Heavy endpoint rate limit
+                await asyncio.sleep(self.cfg.heavy_endpoint_delay)
+
+        if events:
+            logger.info(
+                "flow_monitor.events",
+                count=len(events),
+                types=[e["signal_type"] for e in events],
+            )
+
+        return events
 
 
 class WalletTracker:

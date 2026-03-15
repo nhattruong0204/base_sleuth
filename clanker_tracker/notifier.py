@@ -640,6 +640,234 @@ class TelegramNotifier:
             logger.error("telegram.nansen_signal.failed", error=str(exc))
             return False
 
+    # ------------------------------------------------------------------
+    # Milestone alert — ATH / multiplier milestone for alerted tokens
+    # ------------------------------------------------------------------
+
+    async def notify_milestone(self, event: dict) -> bool:
+        """Send alert when a token reaches a new ATH or multiplier milestone.
+
+        event keys:
+            event_type: 'ath' | 'multiplier'
+            token_name, token_symbol, token_address
+            alert_mcap: MCap at time of original alert
+            alert_fdv: FDV at time of original alert
+            current_mcap: Current MCap
+            current_fdv: Current FDV
+            current_liq: Current liquidity
+            current_price: Current price
+            ath_mcap: All-time high MCap
+            multiplier: Current whole-number multiplier (e.g. 3 for 3x)
+            pnl_pct: Percentage gain since alert
+        """
+        if not self.enabled:
+            return False
+
+        event_type = event.get("event_type", "milestone")
+        token_name = _esc(event.get("token_name") or "?")
+        token_sym = _esc(event.get("token_symbol") or "?")
+        token_addr = event.get("token_address") or ""
+        alert_mcap = event.get("alert_mcap") or 0
+        alert_fdv = event.get("alert_fdv") or 0
+        current_mcap = event.get("current_mcap") or 0
+        current_liq = event.get("current_liq") or 0
+        current_price = event.get("current_price") or 0
+        ath_mcap = event.get("ath_mcap") or 0
+        multiplier = event.get("multiplier") or 0
+        pnl_pct = event.get("pnl_pct") or 0
+
+        # Reference value for comparison (prefer FDV, fallback to MCap)
+        ref_val = alert_fdv if alert_fdv and alert_fdv > 0 else alert_mcap
+        ref_label = "FDV" if alert_fdv and alert_fdv > 0 else "MCap"
+
+        lines: list[str] = []
+
+        if event_type == "ath":
+            lines.append(f"🏆 <b>NEW ATH: {token_name} (${token_sym})</b>")
+            lines.append("")
+            lines.append(f"📈 ATH MCap: <b>${_fmt_number(ath_mcap)}</b>")
+            lines.append(f"💰 Current MCap: ${_fmt_number(current_mcap)}")
+        else:
+            x_emoji = "🚀" if multiplier >= 5 else "📈" if multiplier >= 3 else "✅"
+            lines.append(f"{x_emoji} <b>{multiplier}x MILESTONE: {token_name} (${token_sym})</b>")
+            lines.append("")
+            lines.append(f"📊 Current MCap: <b>${_fmt_number(current_mcap)}</b>")
+
+        # Alert-time reference
+        lines.append(f"🔔 Alert {ref_label}: ${_fmt_number(ref_val)}")
+        lines.append(f"📈 Gain: <b>+{pnl_pct:.0f}%</b>")
+
+        if current_liq and current_liq > 0:
+            lines.append(f"💧 Liquidity: ${_fmt_number(current_liq)}")
+        if current_price and current_price > 0:
+            if current_price >= 0.01:
+                lines.append(f"💵 Price: ${current_price:,.4f}")
+            else:
+                lines.append(f"💵 Price: ${current_price:.6g}")
+
+        lines.append("")
+        lines.append(f"CA: <code>{token_addr}</code>")
+        lines.append(
+            f'📊 <a href="https://dexscreener.com/base/{token_addr}">DexScreener</a>'
+            f' | 🦄 <a href="https://app.uniswap.org/swap?chain=base&outputCurrency={token_addr}">Uniswap</a>'
+        )
+
+        message = "\n".join(lines)
+
+        buttons = InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton(
+                    "📊 Chart",
+                    url=f"https://dexscreener.com/base/{token_addr}",
+                ),
+                InlineKeyboardButton(
+                    "🦄 Swap",
+                    url=f"https://app.uniswap.org/swap?chain=base&outputCurrency={token_addr}",
+                ),
+            ],
+        ])
+
+        try:
+            async with Bot(token=self.cfg.bot_token) as bot:
+                await bot.send_message(
+                    chat_id=self.cfg.chat_id,
+                    text=message,
+                    parse_mode=ParseMode.HTML,
+                    disable_web_page_preview=True,
+                    reply_markup=buttons,
+                )
+            logger.info(
+                "telegram.milestone",
+                type=event_type,
+                token=token_sym,
+                multiplier=multiplier,
+                mcap=current_mcap,
+            )
+            return True
+        except TelegramError as exc:
+            logger.error("telegram.milestone.failed", error=str(exc))
+            return False
+
+    # ------------------------------------------------------------------
+    # Dead token notification — token marked as dead
+    # ------------------------------------------------------------------
+
+    async def notify_dead_token(self, event: dict) -> bool:
+        """Send notification when a token is marked as dead.
+
+        event keys: token_name, token_symbol, token_address,
+                    alert_mcap, current_mcap, current_liq, days_since_alert
+        """
+        if not self.enabled:
+            return False
+
+        token_name = _esc(event.get("token_name") or "?")
+        token_sym = _esc(event.get("token_symbol") or "?")
+        token_addr = event.get("token_address") or ""
+        alert_mcap = event.get("alert_mcap") or 0
+        current_mcap = event.get("current_mcap") or 0
+        current_liq = event.get("current_liq") or 0
+        days = event.get("days_since_alert") or 0
+
+        pnl_pct = ((current_mcap / alert_mcap) - 1) * 100 if alert_mcap > 0 else -100
+
+        message = (
+            f"💀 <b>DEAD: {token_name} (${token_sym})</b>\n\n"
+            f"📉 MCap: ${_fmt_number(current_mcap)} ({pnl_pct:+.0f}%)\n"
+            f"💧 Liq: ${_fmt_number(current_liq)}\n"
+            f"🔔 Alert MCap was: ${_fmt_number(alert_mcap)}\n"
+            f"⏰ {days:.0f} days since alert\n\n"
+            f"<i>Token removed from milestone tracking.</i>"
+        )
+
+        try:
+            async with Bot(token=self.cfg.bot_token) as bot:
+                await bot.send_message(
+                    chat_id=self.cfg.chat_id,
+                    text=message,
+                    parse_mode=ParseMode.HTML,
+                    disable_web_page_preview=True,
+                    disable_notification=True,  # Silent for dead tokens
+                )
+            logger.info("telegram.dead_token", token=token_sym)
+            return True
+        except TelegramError as exc:
+            logger.error("telegram.dead_token.failed", error=str(exc))
+            return False
+
+
+    # ------------------------------------------------------------------
+    # Flow alert — dump warning / accumulation signal from Arkham
+    # ------------------------------------------------------------------
+
+    async def notify_flow_alert(self, event: dict) -> bool:
+        """Send a token flow alert when Arkham detects significant fund movement.
+
+        Event types:
+        - dump_warning: Large outflows from whales/funds → sell signal
+        - accumulation: Sustained inflows from smart money → buy signal
+        """
+        if not self.enabled:
+            return False
+
+        event_type = event.get("type", "unknown")
+        token_name = _esc(event.get("token_name") or "?")
+        token_sym = _esc(event.get("token_symbol") or "?")
+        token_addr = event.get("token_address") or ""
+        total_usd = event.get("total_usd") or 0.0
+        top_movers = event.get("top_movers") or []
+
+        if event_type == "dump_warning":
+            emoji = "🚨"
+            label = "DUMP WARNING"
+            direction = "outflows"
+        elif event_type == "accumulation":
+            emoji = "🟢"
+            label = "ACCUMULATION"
+            direction = "inflows"
+        else:
+            emoji = "📊"
+            label = "FLOW ALERT"
+            direction = "flows"
+
+        # Build movers list (top 5)
+        movers_lines = []
+        for m in top_movers[:5]:
+            entity = _esc(m.get("entity") or m.get("address", "")[:10])
+            usd = _fmt_number(m.get("usd_value") or 0)
+            movers_lines.append(f"  • {entity}: ${usd}")
+        movers_text = "\n".join(movers_lines) if movers_lines else "  (no details)"
+
+        message = (
+            f"{emoji} <b>{label}: {token_name} (${token_sym})</b>\n\n"
+            f"Total {direction}: <b>${_fmt_number(total_usd)}</b>\n\n"
+            f"<b>Top movers:</b>\n{movers_text}\n\n"
+            f"🔗 <a href=\"https://dexscreener.com/base/{token_addr}\">DexScreener</a>"
+            f" · <a href=\"https://platform.arkhamintelligence.com/explorer/token/base/{token_addr}\">Arkham</a>"
+        )
+
+        from telegram import Bot
+        from telegram.constants import ParseMode
+
+        try:
+            async with Bot(token=self.cfg.bot_token) as bot:
+                await bot.send_message(
+                    chat_id=self.cfg.chat_id,
+                    text=message,
+                    parse_mode=ParseMode.HTML,
+                    disable_web_page_preview=True,
+                )
+            logger.info(
+                "telegram.flow_alert",
+                type=event_type,
+                token=token_sym,
+                usd=total_usd,
+            )
+            return True
+        except TelegramError as exc:
+            logger.error("telegram.flow_alert.failed", error=str(exc))
+            return False
+
 
 def _esc(text: str) -> str:
     """Escape HTML special characters for Telegram."""

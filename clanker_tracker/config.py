@@ -138,6 +138,19 @@ class FilteringConfig(BaseModel):
             "ponzi", "fake", "drain",
         ],
     )
+    # Platform/ecosystem name impersonation — tokens using names of known
+    # platforms are almost always scam tokens gaming wash-trade metrics.
+    # These get hard-rejected in Stage 1 regardless of DEX metrics.
+    impersonation_names: list[str] = Field(
+        default_factory=lambda: [
+            "clanker", "clawnch", "bankr", "uniswap", "dexscreener",
+            "coinbase", "ethereum", "solana", "opensea", "metamask",
+            "basescan", "etherscan", "aave", "compound", "aerodrome",
+            "warpcast", "farcaster", "base chain", "basechain",
+        ],
+        description="Token names/symbols that match known platform names are rejected "
+                    "as impersonation scams (case-insensitive exact match)",
+    )
     min_mcap_usd: float = 1_000.0
 
     # ── Stage 2 — DEX metrics (DexScreener batch lookup) ──
@@ -246,7 +259,7 @@ class FilteringConfig(BaseModel):
         description="Skip full scoring for firehose tokens (0%% gem rate — ingestion only)",
     )
     min_alert_mcap_usd: float = Field(
-        default=50_000.0,
+        default=25_000.0,
         description="Hard MCap floor at alert time — tokens below this never alert",
     )
     min_alert_liquidity_usd: float = Field(
@@ -254,8 +267,43 @@ class FilteringConfig(BaseModel):
         description="Hard liquidity floor at alert time — tokens below this never alert",
     )
     duplicate_symbol_cooldown_seconds: int = Field(
-        default=7200,
-        description="Don't alert on a symbol already alerted within this window (2h default)",
+        default=86400,
+        description="Don't alert on a symbol already alerted within this window (24h default)",
+    )
+
+
+class GatePendingConfig(BaseModel):
+    """Gate-pending re-scan — catches tokens that scored well but had low MCap/Liq.
+
+    When a token passes the full scoring pipeline (>= threshold) but fails
+    the hard MCap or liquidity gate, it's marked as 'gate_pending'. A
+    dedicated loop re-checks these tokens periodically to see if MCap/Liq
+    grew above the gate. If so, the alert fires.
+
+    Data-driven rationale: 107 tokens scored 0.45-0.88 were blocked by the
+    $50K MCap gate. Many gems start small and pump later. COOK had $48.5K
+    MCap (score 0.75) — just $1,500 below the gate and was never re-checked.
+    """
+
+    enabled: bool = Field(
+        default=True,
+        description="Enable gate-pending re-scan loop",
+    )
+    recheck_interval_seconds: int = Field(
+        default=600,
+        ge=60,
+        description="How often to re-check gate-pending tokens (10 min default)",
+    )
+    max_rechecks: int = Field(
+        default=18,
+        ge=1,
+        description="Max re-check attempts before giving up (18 * 10min = 3 hours)",
+    )
+    batch_size: int = Field(
+        default=30,
+        ge=1,
+        le=30,
+        description="Max tokens per DexScreener batch (API limit: 30)",
     )
 
 
@@ -459,13 +507,17 @@ class PIDConfig(BaseModel):
 
 
 class ArkhamConfig(BaseModel):
-    """Arkham Intel API integration for smart wallet tracking.
+    """Arkham Intel API integration for smart wallet tracking and on-chain intelligence.
 
     Uses the Arkham Intel API to:
     1. Fetch wallets tagged 'fomo-user' on Base
     2. Analyze wallet performance (PnL over 1d/7d/30d)
     3. Monitor wallet swaps for buy signals
     4. Generate conviction alerts when wallets buy known tokens
+    5. Token Holder Intelligence — identify WHO holds a token (funds, VCs, whales)
+    6. Deployer Profiling — identify WHO deployed a token (scammer? builder?)
+    7. Token Flow Intelligence — detect smart money dumps/accumulation
+    8. Portfolio Watch — detect new positions from tracked wallets
     """
 
     enabled: bool = Field(
@@ -547,7 +599,99 @@ class ArkhamConfig(BaseModel):
     )
     heavy_endpoint_delay: float = Field(
         default=1.1,
-        description="Seconds between heavy endpoint calls (swaps, transfers)",
+        description="Seconds between heavy endpoint calls (swaps, transfers, top_flow)",
+    )
+
+    # ── Token Holder Intelligence (THI) ──
+    holder_intel_enabled: bool = Field(
+        default=True,
+        description="Analyze top token holders via Arkham during scoring",
+    )
+    holder_known_entity_bonus: float = Field(
+        default=0.08,
+        ge=0.0,
+        le=0.30,
+        description="Score bonus when token has known Arkham-labeled holders",
+    )
+    holder_fund_vc_bonus: float = Field(
+        default=0.12,
+        ge=0.0,
+        le=0.30,
+        description="Score bonus when fund/VC entities hold the token",
+    )
+    holder_concentration_penalty: float = Field(
+        default=0.10,
+        ge=0.0,
+        le=0.30,
+        description="Score penalty when top 10 holders own >80% of supply",
+    )
+    holder_max_top10_pct: float = Field(
+        default=80.0,
+        ge=50.0,
+        le=100.0,
+        description="Concentration threshold: top 10 holders % to trigger penalty",
+    )
+    holder_exchange_risk_penalty: float = Field(
+        default=0.05,
+        ge=0.0,
+        le=0.20,
+        description="Penalty when 3+ exchange addresses hold the token (exit risk)",
+    )
+
+    # ── Deployer Profiling ──
+    deployer_profiling_enabled: bool = Field(
+        default=True,
+        description="Profile token deployer via Arkham contract intelligence",
+    )
+    deployer_known_builder_bonus: float = Field(
+        default=0.10,
+        ge=0.0,
+        le=0.30,
+        description="Score bonus when deployer is a known/reputable entity",
+    )
+    deployer_scam_reject: bool = Field(
+        default=True,
+        description="Hard reject tokens whose deployer has scam/exploit/sanctioned tags",
+    )
+    deployer_proxy_penalty: float = Field(
+        default=0.08,
+        ge=0.0,
+        le=0.20,
+        description="Score penalty for upgradeable proxy contracts (rug vector)",
+    )
+
+    # ── Token Flow Monitoring ──
+    flow_monitoring_enabled: bool = Field(
+        default=True,
+        description="Monitor token flows for dump/accumulation detection on alerted tokens",
+    )
+    flow_poll_interval_seconds: int = Field(
+        default=300,
+        ge=60,
+        description="How often to check flows for monitored tokens (seconds)",
+    )
+    flow_min_usd: float = Field(
+        default=5_000.0,
+        description="Minimum USD flow from a known entity to consider significant",
+    )
+    flow_alert_threshold_usd: float = Field(
+        default=10_000.0,
+        description="Total known-entity flow above this triggers an alert",
+    )
+
+    # ── Portfolio Watch ──
+    portfolio_watch_enabled: bool = Field(
+        default=True,
+        description="Periodically check Tier 1 wallet portfolios for new positions",
+    )
+    portfolio_poll_interval_seconds: int = Field(
+        default=600,
+        ge=120,
+        description="How often to scan smart wallet portfolios (seconds)",
+    )
+    portfolio_min_position_usd: float = Field(
+        default=500.0,
+        description="Minimum position size in USD to consider as a signal",
     )
 
 
@@ -777,6 +921,170 @@ class MultiWalletConvictionConfig(BaseModel):
     )
 
 
+class MilestoneTrackerConfig(BaseModel):
+    """Milestone tracker — monitors alerted tokens for ATH / multiplier milestones.
+
+    Every scan_interval_seconds, fetches live DEX data for all non-dead
+    alerted tokens. Notifies on:
+    - New all-time-high MCap
+    - Whole-number multiplier thresholds (1x, 2x, 3x, ...) vs alert FDV/MCap
+
+    Marks tokens as dead when liquidity or MCap drops below threshold
+    for dead_confirmation_hours, stopping further monitoring.
+    """
+
+    enabled: bool = Field(
+        default=True,
+        description="Enable milestone tracker loop",
+    )
+    scan_interval_seconds: int = Field(
+        default=300,
+        ge=60,
+        description="How often to scan alerted tokens for milestones (5 min default)",
+    )
+    dead_liq_threshold_usd: float = Field(
+        default=200.0,
+        description="Liquidity below this marks token as potentially dead ($)",
+    )
+    dead_mcap_threshold_usd: float = Field(
+        default=500.0,
+        description="MCap below this marks token as potentially dead ($)",
+    )
+    dead_confirmation_hours: int = Field(
+        default=24,
+        ge=1,
+        description="Hours a token must stay below thresholds before marked dead",
+    )
+    max_token_age_days: int = Field(
+        default=30,
+        ge=1,
+        description="Stop tracking tokens older than this (days since alert)",
+    )
+    batch_size: int = Field(
+        default=30,
+        ge=1,
+        le=30,
+        description="Max tokens per DexScreener batch (API limit: 30)",
+    )
+    notify_ath: bool = Field(
+        default=True,
+        description="Send Telegram alert on new all-time-high MCap",
+    )
+    notify_multiplier: bool = Field(
+        default=True,
+        description="Send Telegram alert on new multiplier milestone (2x, 3x, ...)",
+    )
+    min_multiplier_notify: int = Field(
+        default=2,
+        ge=1,
+        description="Minimum multiplier to start notifying (1=notify from 1x, 2=from 2x)",
+    )
+    ath_cooldown_seconds: int = Field(
+        default=3600,
+        ge=300,
+        description="Minimum time between ATH notifications for the same token",
+    )
+
+
+class BinanceSkillsConfig(BaseModel):
+    """Binance Skills Hub integration for Base chain intelligence.
+
+    Uses multiple public Binance Web3 Skills APIs:
+    1. Unified Token Rank — trending / top-search tokens on Base (chain 8453)
+    2. Social Hype — social buzz leaderboard with AI sentiment summaries
+    3. Token Security Audit — honeypot / scam / rug detection
+    4. Token Dynamic Data — rich market data with KOL / smart money holder %
+    5. Token Search — cross-chain token lookup by keyword / address
+    6. Wallet Balance — on-chain wallet token positions
+
+    All endpoints are public (no API key required).
+    Docs: https://developers.binance.com/en/skills
+    """
+
+    enabled: bool = Field(
+        default=True,
+        description="Enable Binance Skills Hub integration",
+    )
+
+    # ── Trending scanner settings ──
+    trending_poll_interval_seconds: int = Field(
+        default=180,
+        ge=60,
+        description="How often to scan Binance for trending Base tokens (seconds)",
+    )
+    trending_min_mcap: float = Field(
+        default=10_000.0,
+        description="Min market cap for trending token discovery ($)",
+    )
+    trending_max_mcap: float = Field(
+        default=50_000_000.0,
+        description="Max market cap for trending tokens (skip blue chips)",
+    )
+    trending_min_liquidity: float = Field(
+        default=5_000.0,
+        description="Min liquidity for trending token discovery ($)",
+    )
+    trending_score_bonus: float = Field(
+        default=0.05,
+        ge=0.0,
+        le=0.50,
+        description="Flat score bonus for tokens discovered via Binance trending",
+    )
+
+    # ── Token security audit settings ──
+    audit_enabled: bool = Field(
+        default=True,
+        description="Run Binance token security audit during scoring",
+    )
+    audit_max_risk_level: int = Field(
+        default=3,
+        ge=0,
+        le=5,
+        description="Max risk level to allow (0-1=LOW, 2-3=MEDIUM, 4=HIGH, 5=BLOCKED)",
+    )
+    audit_high_tax_pct: float = Field(
+        default=10.0,
+        description="Buy/sell tax above this % triggers a warning",
+    )
+    audit_score_bonus: float = Field(
+        default=0.05,
+        ge=0.0,
+        le=0.20,
+        description="Score bonus for tokens passing security audit (LOW risk)",
+    )
+    audit_penalty: float = Field(
+        default=0.15,
+        ge=0.0,
+        le=1.0,
+        description="Score penalty for tokens with MEDIUM risk audit",
+    )
+
+    # ── Enrichment settings (Token Dynamic Data) ──
+    enrich_enabled: bool = Field(
+        default=True,
+        description="Fetch rich holder data (KOL/smart money/pro) from Binance during scoring",
+    )
+    kol_holder_bonus: float = Field(
+        default=0.05,
+        ge=0.0,
+        le=0.20,
+        description="Score bonus when token has KOL holders",
+    )
+    smart_money_holder_bonus: float = Field(
+        default=0.08,
+        ge=0.0,
+        le=0.20,
+        description="Score bonus when token has Binance-tracked smart money holders",
+    )
+
+    # ── Rate limiting ──
+    request_delay_seconds: float = Field(
+        default=0.5,
+        ge=0.1,
+        description="Minimum delay between Binance API calls (seconds)",
+    )
+
+
 class ScrapingConfig(BaseModel):
     """Settings for the context resolver scraper."""
     clanker_page_url: str = "https://www.clanker.world/clanker/{address}"
@@ -806,6 +1114,9 @@ class AppConfig(BaseModel):
     champagne_eval: ChampagneEvalConfig = Field(default_factory=ChampagneEvalConfig)
     paper_trading: PaperTradingConfig = Field(default_factory=PaperTradingConfig)
     multi_conviction: MultiWalletConvictionConfig = Field(default_factory=MultiWalletConvictionConfig)
+    binance_skills: BinanceSkillsConfig = Field(default_factory=BinanceSkillsConfig)
+    milestone_tracker: MilestoneTrackerConfig = Field(default_factory=MilestoneTrackerConfig)
+    gate_pending: GatePendingConfig = Field(default_factory=GatePendingConfig)
     telegram: TelegramConfig = Field(default_factory=TelegramConfig)
     scraping: ScrapingConfig = Field(default_factory=ScrapingConfig)
     log_level: str = "INFO"

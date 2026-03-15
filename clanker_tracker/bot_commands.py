@@ -456,15 +456,38 @@ async def _build_status_text(tracker: Tracker) -> str:
     # Loop health
     loop_lines = []
     loop_emoji = {0: "🟢", 1: "🟡", 2: "🟠"}
-    for name in ("poll", "champagne", "breakout", "eval"):
-        backoff = tracker._backoff.get(name, 0)
+
+    # Display names for all 16 loops
+    loop_names = {
+        "poll": "Firehose",
+        "champagne": "Champagne",
+        "breakout": "Breakout",
+        "gainers": "Gainers",
+        "binance_trending": "Binance Trending",
+        "eval": "Eval Pipeline",
+        "outcome": "PID Outcome",
+        "wallet_sync": "Wallet Sync",
+        "wallet_monitor": "Wallet Monitor",
+        "wallet_watch": "Wallet Watch",
+        "nansen": "Nansen Listener",
+        "champagne_eval": "Champagne Eval",
+        "paper_trading": "Paper Trading",
+        "multi_conviction": "Multi Conviction",
+        "token_flow": "Token Flow",
+        "portfolio_watch": "Portfolio Watch",
+        "milestone_tracker": "Milestone Tracker",
+        "gate_pending": "Gate Pending",
+    }
+
+    for key, display in loop_names.items():
+        backoff = tracker._backoff.get(key, 0)
         emoji = loop_emoji.get(backoff, "🔴")
-        delay = tracker._backoff_delay(name)
+        delay = tracker._backoff_delay(key)
         if backoff == 0:
-            loop_lines.append(f"  {emoji} {name.title()}: healthy")
+            loop_lines.append(f"  {emoji} {display}: healthy")
         else:
             loop_lines.append(
-                f"  {emoji} {name.title()}: backoff x{backoff} (+{delay:.0f}s)"
+                f"  {emoji} {display}: backoff x{backoff} (+{delay:.0f}s)"
             )
 
     loop_status = "\n".join(loop_lines)
