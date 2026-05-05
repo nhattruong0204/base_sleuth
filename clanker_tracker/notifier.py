@@ -22,6 +22,7 @@ from telegram.error import TelegramError
 
 from .config import AppConfig
 from .filters import FilterResult
+from .minara_client import MinaraClient, MinaraDecision
 from .models import SmartWallet, Token, TokenContext
 
 logger = structlog.get_logger(__name__)
@@ -33,6 +34,7 @@ class TelegramNotifier:
     _DEX_BASE = "https://api.dexscreener.com/latest/dex"
 
     def __init__(self, config: AppConfig) -> None:
+        self.app_cfg = config
         self.cfg = config.telegram
         self._bot: Optional[Bot] = None
         if self.cfg.bot_token:
@@ -41,6 +43,7 @@ class TelegramNotifier:
             timeout=10,
             headers={"User-Agent": "BaseSleuth/1.0"},
         )
+        self._minara = MinaraClient(config, self._http)
 
     @property
     def enabled(self) -> bool:
@@ -128,8 +131,28 @@ class TelegramNotifier:
             logger.warning("telegram.disabled", reason="missing bot_token or chat_id")
             return False
 
+        # Minara is intentionally scoped to this New Token Alert path.
+        # Other notifier methods (wallet buys, convictions, milestones,
+        # dead-token notices, flow alerts) skip Minara to avoid x402 spend.
         dex = await self._fetch_live_dex(token.contract_address)
-        message = self._format_message(token, ctx, result, nansen_buys=nansen_buys, dex=dex)
+        minara = await self._minara.analyze_alert(
+            token, ctx, result, dex=dex, nansen_buys=nansen_buys,
+        )
+        if not self._minara.allows_alert(minara):
+            logger.info(
+                "telegram.blocked_by_minara",
+                token=token.symbol,
+                decision=minara.decision if minara else None,
+                confidence=minara.confidence if minara else None,
+            )
+            return False
+
+        message = self._format_message(
+            token, ctx, result,
+            nansen_buys=nansen_buys,
+            dex=dex,
+            minara=minara,
+        )
         buttons = self._build_alert_buttons(token)
 
         try:
@@ -160,6 +183,7 @@ class TelegramNotifier:
         *,
         nansen_buys: list[dict] | None = None,
         dex: dict | None = None,
+        minara: MinaraDecision | None = None,
     ) -> str:
         lines: list[str] = []
 
@@ -273,6 +297,10 @@ class TelegramNotifier:
             if n_wallets > 3:
                 lines.append(f"  … +{n_wallets - 3} more")
 
+        # ── Minara AI thesis ────────────────────────────────
+        if minara and self.app_cfg.minara.include_thesis:
+            lines.extend(self._format_minara_lines(minara))
+
         # ── Time since launch ───────────────────────────────
         launched = getattr(token, "launched_at", None)
         if launched:
@@ -293,6 +321,25 @@ class TelegramNotifier:
             lines.append(f"⏰ Time Since Launch: {age_str}")
 
         return "\n".join(lines)
+
+    @staticmethod
+    def _format_minara_lines(minara: MinaraDecision) -> list[str]:
+        lines = ["", "<b>Minara Thesis:</b>"]
+        decision = _esc(minara.decision or "UNKNOWN")
+        if minara.confidence is not None:
+            lines.append(f"Decision: <b>{decision}</b> ({minara.confidence}% confidence)")
+        else:
+            lines.append(f"Decision: <b>{decision}</b>")
+        if minara.thesis:
+            lines.append(f"<i>{_esc(minara.thesis)}</i>")
+        if minara.time_horizon:
+            lines.append(f"Time horizon: {_esc(minara.time_horizon)}")
+        if minara.invalidation:
+            lines.append(f"Invalidation: {_esc(minara.invalidation)}")
+        if minara.risks:
+            risk_text = "; ".join(minara.risks[:3])
+            lines.append(f"Risks: {_esc(risk_text)}")
+        return lines
 
     @staticmethod
     def _score_bar(score: float, length: int = 10) -> str:

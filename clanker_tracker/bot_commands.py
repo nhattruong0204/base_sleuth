@@ -723,6 +723,14 @@ def _build_config_text(tracker: Tracker) -> str:
     f = tracker.cfg.filtering
     b = tracker.cfg.breakout
     c = tracker.cfg.clanker
+    m = tracker.cfg.minara
+    minara_ready = (
+        m.enabled
+        and (
+            (m.auth_method == "api_key" and m.api_key)
+            or (m.auth_method == "x402" and m.x402_evm_private_key)
+        )
+    )
 
     return (
         "⚙️ <b>Current Configuration</b>\n\n"
@@ -751,7 +759,13 @@ def _build_config_text(tracker: Tracker) -> str:
         f"  Momentum: {f.weight_momentum}\n"
         f"  Smart money: {f.weight_smart_money}\n"
         f"  Context: {f.weight_context}\n"
-        f"  Champagne bonus: +{f.weight_champagne_bonus:.0%}"
+        f"  Champagne bonus: +{f.weight_champagne_bonus:.0%}\n\n"
+        "<b>Minara AI:</b>\n"
+        f"  Enabled: {'✅ Yes' if minara_ready else '❌ No'}\n"
+        f"  Auth: {m.auth_method}\n"
+        f"  Mode: {m.mode}\n"
+        f"  Append thesis: {'✅ Yes' if m.include_thesis else '❌ No'}\n"
+        f"  Gate alerts: {'✅ Yes' if m.gate_alerts else '❌ No'}"
     )
 
 

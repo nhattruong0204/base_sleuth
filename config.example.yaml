@@ -375,6 +375,28 @@ binance_skills:
   # Rate limiting
   request_delay_seconds: 0.5           # Min delay between Binance API calls
 
+# ── Minara AI — pre-alert thesis / decision layer ─────────────
+# Uses Minara Agent API Developer Chat before Telegram gem alerts.
+# Docs: https://minara.ai/docs/ecosystem/agent-api/api-reference/api-reference-api-key
+minara:
+  enabled: false
+  auth_method: "api_key"               # "api_key" or "x402"
+  api_key: null                        # Prefer MINARA_API_KEY env var
+  base_url: "https://api-developer.minara.ai"
+  x402_base_url: "https://x402.minara.ai"
+  x402_chain: "base"                   # "base" or "polygon" supported by this bot
+  x402_evm_private_key: null           # Prefer EVM_PRIVATE_KEY env var; fund with USDC
+  mode: "fast"                         # "fast" or "expert"
+  timeout_seconds: 15
+  include_thesis: true                 # Append Minara thesis to Telegram alert
+  gate_alerts: false                   # If true, PASS/low-confidence blocks alert
+  fail_open: true                      # If Minara fails, still send alert
+  allowed_decisions:
+    - BUY
+    - WATCH
+  min_confidence: 60
+  max_thesis_chars: 700
+
 # ── Milestone Tracker ───────────────────────────────────
 # Monitors all alerted tokens for price milestones:
 # - ATH (all-time-high MCap) notifications

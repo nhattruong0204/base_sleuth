@@ -1,0 +1,5 @@
+# Optional dependencies for Minara x402 pay-as-you-go mode.
+# Install in addition to requirements.txt when minara.auth_method = "x402".
+
+x402[httpx]
+eth-account>=0.13

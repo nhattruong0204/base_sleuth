@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
-from typing import Optional
+from typing import Literal, Optional
 
 import yaml
 from pydantic import BaseModel, Field
@@ -1085,6 +1085,80 @@ class BinanceSkillsConfig(BaseModel):
     )
 
 
+class MinaraConfig(BaseModel):
+    """Minara Agent API integration for pre-alert thesis and decisioning.
+
+    Uses the Developer Chat endpoint:
+    POST https://api-developer.minara.ai/v1/developer/chat
+    """
+
+    enabled: bool = Field(
+        default=False,
+        description="Enable Minara analysis before Telegram new-token gem alerts only",
+    )
+    auth_method: Literal["api_key", "x402"] = Field(
+        default="api_key",
+        description="Minara auth method: api_key subscription or x402 pay-as-you-go",
+    )
+    api_key: Optional[str] = Field(
+        default=None,
+        description="Minara API key. Prefer MINARA_API_KEY env var.",
+    )
+    base_url: str = Field(
+        default="https://api-developer.minara.ai",
+        description="Minara Developer API base URL",
+    )
+    x402_base_url: str = Field(
+        default="https://x402.minara.ai",
+        description="Minara x402 API base URL",
+    )
+    x402_chain: Literal["base", "polygon"] = Field(
+        default="base",
+        description="Payment chain for x402 chat endpoints",
+    )
+    x402_evm_private_key: Optional[str] = Field(
+        default=None,
+        description="EVM private key for Base/Polygon x402 payments. Prefer EVM_PRIVATE_KEY env var.",
+    )
+    mode: Literal["fast", "expert"] = Field(
+        default="fast",
+        description="Minara model mode: fast or expert",
+    )
+    timeout_seconds: float = Field(
+        default=15.0,
+        ge=1.0,
+        description="HTTP timeout for Minara analysis calls",
+    )
+    include_thesis: bool = Field(
+        default=True,
+        description="Append Minara thesis to Telegram alerts",
+    )
+    gate_alerts: bool = Field(
+        default=False,
+        description="If true, block alerts when Minara decision is not allowed",
+    )
+    fail_open: bool = Field(
+        default=True,
+        description="If Minara fails, still send alerts unless this is false",
+    )
+    allowed_decisions: list[str] = Field(
+        default_factory=lambda: ["BUY", "WATCH"],
+        description="Decisions allowed through when gate_alerts is true",
+    )
+    min_confidence: int = Field(
+        default=60,
+        ge=0,
+        le=100,
+        description="Minimum Minara confidence required when gate_alerts is true",
+    )
+    max_thesis_chars: int = Field(
+        default=700,
+        ge=100,
+        le=2000,
+        description="Max Minara thesis characters appended to Telegram alerts",
+    )
+
+
 class ScrapingConfig(BaseModel):
     """Settings for the context resolver scraper."""
     clanker_page_url: str = "https://www.clanker.world/clanker/{address}"
@@ -1115,6 +1189,7 @@ class AppConfig(BaseModel):
     paper_trading: PaperTradingConfig = Field(default_factory=PaperTradingConfig)
     multi_conviction: MultiWalletConvictionConfig = Field(default_factory=MultiWalletConvictionConfig)
     binance_skills: BinanceSkillsConfig = Field(default_factory=BinanceSkillsConfig)
+    minara: MinaraConfig = Field(default_factory=MinaraConfig)
     milestone_tracker: MilestoneTrackerConfig = Field(default_factory=MilestoneTrackerConfig)
     gate_pending: GatePendingConfig = Field(default_factory=GatePendingConfig)
     telegram: TelegramConfig = Field(default_factory=TelegramConfig)
@@ -1139,6 +1214,9 @@ def _env_override(cfg: dict) -> dict:
         "BASESCAN_API_KEY": ("wallet_monitor", "basescan_api_key"),
         "NANSEN_API_ID": ("nansen", "api_id"),
         "NANSEN_API_HASH": ("nansen", "api_hash"),
+        "MINARA_AUTH_METHOD": ("minara", "auth_method"),
+        "MINARA_API_KEY": ("minara", "api_key"),
+        "EVM_PRIVATE_KEY": ("minara", "x402_evm_private_key"),
     }
     for env_var, path in mapping.items():
         value = os.environ.get(env_var)

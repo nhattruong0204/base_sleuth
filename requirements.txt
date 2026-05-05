@@ -26,5 +26,9 @@ telethon>=1.36
 # Logging
 structlog>=24.0
 
+# Minara x402 pay-as-you-go (optional; required only when minara.auth_method=x402)
+# x402[httpx]>=0.6
+# eth-account>=0.13
+
 # Base chain (optional — for future WebSocket event monitoring)
 # web3>=7.0
