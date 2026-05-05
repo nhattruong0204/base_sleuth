@@ -81,6 +81,9 @@ def _main_menu_keyboard() -> InlineKeyboardMarkup:
             InlineKeyboardButton("📝 Positions", callback_data="positions"),
         ],
         [
+            InlineKeyboardButton("🤖 Minara AI", callback_data="minara_menu"),
+        ],
+        [
             InlineKeyboardButton("❓ Help", callback_data="help"),
         ],
     ])
@@ -109,6 +112,16 @@ def _scan_menu_keyboard() -> InlineKeyboardMarkup:
 def _back_keyboard() -> InlineKeyboardMarkup:
     """Single 'Back to Menu' button."""
     return InlineKeyboardMarkup([
+        [InlineKeyboardButton("⬅️ Back to Menu", callback_data="menu")],
+    ])
+
+
+def _minara_keyboard(tracker: Tracker) -> InlineKeyboardMarkup:
+    """Build Minara control buttons."""
+    m = tracker.cfg.minara
+    toggle_label = "Disable Minara" if m.enabled else "Enable Minara"
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(toggle_label, callback_data="minara_toggle")],
         [InlineKeyboardButton("⬅️ Back to Menu", callback_data="menu")],
     ])
 
@@ -355,6 +368,18 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         text = _build_config_text(tracker)
         await query.edit_message_text(
             text, parse_mode=ParseMode.HTML, reply_markup=_back_keyboard(),
+        )
+
+    elif data == "minara_menu":
+        text = _build_minara_text(tracker)
+        await query.edit_message_text(
+            text, parse_mode=ParseMode.HTML, reply_markup=_minara_keyboard(tracker),
+        )
+
+    elif data == "minara_toggle":
+        text = _toggle_minara(tracker)
+        await query.edit_message_text(
+            text, parse_mode=ParseMode.HTML, reply_markup=_minara_keyboard(tracker),
         )
 
     elif data == "champagne":
@@ -767,6 +792,67 @@ def _build_config_text(tracker: Tracker) -> str:
         f"  Append thesis: {'✅ Yes' if m.include_thesis else '❌ No'}\n"
         f"  Gate alerts: {'✅ Yes' if m.gate_alerts else '❌ No'}"
     )
+
+
+def _minara_ready(tracker: Tracker) -> bool:
+    """Return whether Minara has the credentials needed for its auth mode."""
+    m = tracker.cfg.minara
+    if m.auth_method == "api_key":
+        return bool(m.api_key)
+    if m.auth_method == "x402":
+        return bool(m.x402_evm_private_key)
+    return False
+
+
+def _build_minara_text(tracker: Tracker) -> str:
+    """Build Minara runtime control panel text."""
+    m = tracker.cfg.minara
+    ready = _minara_ready(tracker)
+    active = m.enabled and ready
+    credential_hint = (
+        "Configured"
+        if ready
+        else (
+            "Missing MINARA_API_KEY"
+            if m.auth_method == "api_key"
+            else "Missing EVM_PRIVATE_KEY"
+        )
+    )
+    return (
+        "🤖 <b>Minara AI Analysis</b>\n\n"
+        "Scope: <b>New Token Alert only</b>\n"
+        "Wallet buys, convictions, Nansen, milestones, dead-token, and flow alerts skip Minara.\n\n"
+        f"Status: {'✅ ON' if active else '❌ OFF'}\n"
+        f"Auth: {_esc(m.auth_method)}\n"
+        f"Mode: {_esc(m.mode)}\n"
+        f"Credentials: {_esc(credential_hint)}\n"
+        f"Append thesis: {'✅ Yes' if m.include_thesis else '❌ No'}\n"
+        f"Gate alerts: {'✅ Yes' if m.gate_alerts else '❌ No'}\n\n"
+        "<i>This toggle is runtime-only. After restart, the value comes from config.yaml.</i>"
+    )
+
+
+def _toggle_minara(tracker: Tracker) -> str:
+    """Toggle Minara runtime analysis for new-token alerts."""
+    m = tracker.cfg.minara
+    if m.enabled:
+        m.enabled = False
+        logger.info("minara.runtime_toggle", enabled=False)
+        return _build_minara_text(tracker)
+
+    if not _minara_ready(tracker):
+        logger.info("minara.runtime_toggle_blocked", auth_method=m.auth_method)
+        missing = "MINARA_API_KEY" if m.auth_method == "api_key" else "EVM_PRIVATE_KEY"
+        return (
+            "🤖 <b>Minara AI Analysis</b>\n\n"
+            f"Cannot enable Minara yet: <code>{missing}</code> is not configured.\n\n"
+            "Add the credential, restart the bot, then press Enable Minara again.\n\n"
+            "<i>Minara only applies to New Token Alert messages.</i>"
+        )
+
+    m.enabled = True
+    logger.info("minara.runtime_toggle", enabled=True, auth_method=m.auth_method)
+    return _build_minara_text(tracker)
 
 
 async def _build_wallets_text(tracker: Tracker) -> str:

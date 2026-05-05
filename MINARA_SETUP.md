@@ -4,6 +4,10 @@ This repo uses Minara only for the `New Token Alert` path. Other Telegram messag
 such as wallet buys, convictions, Nansen signals, milestones, dead-token notices,
 and flow alerts intentionally skip Minara to avoid unnecessary API or x402 spend.
 
+The Telegram bot has a `Minara AI` button in the main menu. It toggles Minara
+analysis at runtime for new-token alerts only. The toggle is in-memory; after a
+bot restart, `config.yaml` decides the starting value again.
+
 ## Bot Integration
 
 The bot supports two Minara auth methods:

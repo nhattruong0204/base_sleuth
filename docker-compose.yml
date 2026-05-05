@@ -46,6 +46,9 @@ services:
 
       # Optional overrides
       CLANKER_API_KEY: ${CLANKER_API_KEY:-}
+      MINARA_AUTH_METHOD: ${MINARA_AUTH_METHOD:-}
+      MINARA_API_KEY: ${MINARA_API_KEY:-}
+      EVM_PRIVATE_KEY: ${EVM_PRIVATE_KEY:-}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
     volumes:
       # Mount config.yaml for runtime overrides (optional)

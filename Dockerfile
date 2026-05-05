@@ -18,8 +18,8 @@ RUN apt-get update && \
 # ── Dependencies ──────────────────────────────────────────────
 FROM base AS deps
 
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+COPY requirements.txt requirements-x402.txt ./
+RUN pip install --no-cache-dir -r requirements.txt -r requirements-x402.txt
 
 # ── Application ───────────────────────────────────────────────
 FROM deps AS app
